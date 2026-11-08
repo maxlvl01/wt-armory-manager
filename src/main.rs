@@ -64,13 +64,16 @@ const SETTINGS_FILE: &str = "settings.json";
 /// file link -> upload date (unix seconds; 0 = the server sent none). Keyed by link, so a
 /// re-uploaded file (new link) is looked up again.
 const FILE_DATES_FILE: &str = "file_dates.json";
-const DATE_WORKERS: usize = 4;
+const DATE_WORKERS: usize = 8;
+/// Pages fetched in a row without a new visible card before infinite scroll stops (filters
+/// hiding everything would otherwise pull the whole feed).
+const MAX_DRY_PAGES: u32 = 3;
 /// Downloads that run at the same time; the rest wait in the queue.
 const MAX_PARALLEL_DOWNLOADS: usize = 2;
 /// Finished downloads kept in the Downloads window.
 const HISTORY_LEN: usize = 40;
 /// Shown in the app and used for the release tag (Cargo needs the semver form "0.1.0-alpha").
-const APP_VERSION: &str = "0.2.0a";
+const APP_VERSION: &str = "0.2.1a";
 
 // ---------------------------------------------------------------------------------------------
 // App state
@@ -272,6 +275,9 @@ struct App {
     dates_saved_at: f64,
     date_tx: Sender<String>,
     only_current: bool,
+    /// Auto-loaded pages in a row that added no visible card, and the visible count at the last fetch.
+    dry_pages: u32,
+    shown_at_fetch: usize,
 
     /// `hangarBlk` value from config.blk; `None` = default hangar.
     current_hangar: Option<String>,
@@ -370,6 +376,8 @@ impl App {
             dates_saved_at: 0.0,
             date_tx,
             only_current: false,
+            dry_pages: 0,
+            shown_at_fetch: 0,
             current_hangar: None,
             hangar_prompt: None,
         };
@@ -401,6 +409,18 @@ impl App {
     /// Development aid for screenshots: `WTAM_SCREEN=sound|following|creator:<id>|downloads|bug`.
     fn dev_start_screen(&mut self) {
         let Ok(screen) = std::env::var("WTAM_SCREEN") else { return };
+        // WTAM_SORT=<n> picks the n-th sort chip.
+        if let Some(sort) = std::env::var("WTAM_SORT").ok().and_then(|s| s.parse::<usize>().ok()).and_then(|i| Sort::ALL.get(i)) {
+            self.sort = *sort;
+        }
+        // "+current" turns on the "Only made for X+" filter.
+        let screen = match screen.strip_suffix("+current") {
+            Some(s) => {
+                self.only_current = true;
+                s.to_string()
+            }
+            None => screen,
+        };
         let (what, arg) = screen.split_once(':').unwrap_or((screen.as_str(), ""));
         match what {
             "following" => {
@@ -1012,6 +1032,8 @@ impl App {
         self.end = false;
         self.loading = false;
         self.feed_err = None;
+        self.dry_pages = 0;
+        self.shown_at_fetch = 0;
         self.fetch_next();
     }
 
@@ -1633,8 +1655,13 @@ impl App {
             .filter(|p| !self.hidden_by_filter(p))
             .collect();
         let hidden = self.posts.len() - shown.len();
+        // Posts whose upload date is still being checked: with "Only made for" on they are hidden
+        // until the answer comes, so judge whether a page added anything only after that.
+        let checking = if self.only_current { self.posts.iter().filter(|p| self.compat_of(p).is_none()).count() } else { 0 };
+        let shown_count = shown.len();
+        let stalled = self.dry_pages >= MAX_DRY_PAGES;
 
-        let (mut want_more, mut retry) = (false, false);
+        let (mut want_more, mut manual, mut retry) = (false, false, false);
         egui::ScrollArea::vertical()
             .id_salt(("feed", self.gen))
             .auto_shrink([false, false])
@@ -1654,8 +1681,11 @@ impl App {
                 }
                 ui.add_space(4.0);
                 ui.vertical_centered(|ui| {
-                    if hidden > 0 {
-                        ui.label(muted(format!("{hidden} item(s) hidden by the filters")));
+                    if hidden > checking {
+                        ui.label(muted(format!("{} item(s) hidden by the filters", hidden - checking)));
+                    }
+                    if checking > 0 {
+                        ui.label(muted(format!("Checking when {checking} item(s) were last updated...")));
                     }
                     if self.loading {
                         ui.add(egui::Spinner::new().size(28.0).color(ACCENT));
@@ -1672,9 +1702,15 @@ impl App {
                             "That's everything."
                         }));
                     } else {
+                        if stalled {
+                            ui.label(muted("Most posts here are hidden by your filters, so loading stopped. Press Load more to keep looking."));
+                        }
                         let r = button(ui, None, "Load more", BTN, TEXT, None, true);
-                        // Infinite scroll: load the next page as soon as the button scrolls into view.
-                        if r.clicked() || ui.is_rect_visible(r.rect) {
+                        if r.clicked() {
+                            manual = true;
+                        // Infinite scroll: load the next page as soon as the button scrolls into
+                        // view, but not while dates are pending or after several empty pages.
+                        } else if ui.is_rect_visible(r.rect) && checking == 0 && !stalled {
                             want_more = true;
                         }
                     }
@@ -1683,10 +1719,23 @@ impl App {
             });
         if retry {
             self.feed_err = None;
-            want_more = true;
+            manual = true;
         }
-        if want_more && self.feed_err.is_none() {
+        if manual {
+            self.dry_pages = 0;
+            self.shown_at_fetch = shown_count;
             self.fetch_next();
+        } else if want_more && self.feed_err.is_none() {
+            // Count this page as dry if the previous one added no visible card.
+            if self.page > 0 && shown_count <= self.shown_at_fetch {
+                self.dry_pages += 1;
+            } else {
+                self.dry_pages = 0;
+            }
+            self.shown_at_fetch = shown_count;
+            if self.dry_pages < MAX_DRY_PAGES {
+                self.fetch_next();
+            }
         }
     }
 

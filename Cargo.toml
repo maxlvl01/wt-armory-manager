@@ -1,6 +1,6 @@
 [package]
 name = "wt-armory-manager"
-version = "0.2.0-alpha"
+version = "0.2.1-alpha"
 license = "MIT"
 repository = "https://github.com/maxlvl01/wt-armory-manager"
 edition = "2021"
