@@ -27,7 +27,7 @@ Browse [live.warthunder.com](https://live.warthunder.com) and install War Thunde
 
 ## Download
 
-Get `WT-Armory-Manager-0.1.0a.exe` from the [Releases](https://github.com/maxlvl01/wt-armory-manager/releases) page and run it. Nothing needs to be installed. Windows SmartScreen may warn you because the exe isn't code-signed.
+Get the latest `WT-Armory-Manager-<version>.exe` from the [Releases](https://github.com/maxlvl01/wt-armory-manager/releases) page and run it. Nothing needs to be installed. Windows SmartScreen may warn you because the exe isn't code-signed.
 
 ## Build from source
 

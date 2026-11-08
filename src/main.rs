@@ -63,7 +63,7 @@ const SETTINGS_FILE: &str = "settings.json";
 const FILE_DATES_FILE: &str = "file_dates.json";
 const DATE_WORKERS: usize = 4;
 /// Shown in the app and used for the release tag (Cargo needs the semver form "0.1.0-alpha").
-const APP_VERSION: &str = "0.1.0a";
+const APP_VERSION: &str = "0.1.1a";
 
 // ---------------------------------------------------------------------------------------------
 // App state
