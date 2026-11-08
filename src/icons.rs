@@ -15,6 +15,13 @@ pub enum Icon {
     Refresh,
     Search,
     External,
+    Close,
+    Bug,
+    Star(bool),
+    User,
+    Comment,
+    Login,
+    Update,
 }
 
 pub fn show(ui: &mut egui::Ui, icon: Icon, size: f32, color: Color32) -> egui::Response {
@@ -145,6 +152,60 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, c: Color32) {
             p.add(Shape::line(vec![at(0.45, 0.15), at(0.12, 0.15), at(0.12, 0.88), at(0.85, 0.88), at(0.85, 0.55)], st));
             p.line_segment([at(0.42, 0.58), at(0.88, 0.12)], st);
             p.add(Shape::line(vec![at(0.58, 0.12), at(0.88, 0.12), at(0.88, 0.42)], st));
+        }
+        Icon::Close => {
+            p.line_segment([at(0.2, 0.2), at(0.8, 0.8)], st);
+            p.line_segment([at(0.8, 0.2), at(0.2, 0.8)], st);
+        }
+        Icon::Bug => {
+            // beetle: oval body, head, three legs per side, antennae
+            p.add(Shape::ellipse_filled(at(0.5, 0.6), vec2(0.22 * s, 0.3 * s), c));
+            p.circle_filled(at(0.5, 0.25), 0.11 * s, c);
+            for (y, dx) in [(0.45, 0.42), (0.6, 0.44), (0.76, 0.4)] {
+                p.line_segment([at(0.5, y), at(0.5 - dx, y - 0.06)], st);
+                p.line_segment([at(0.5, y), at(0.5 + dx, y - 0.06)], st);
+            }
+            p.line_segment([at(0.44, 0.18), at(0.32, 0.04)], st);
+            p.line_segment([at(0.56, 0.18), at(0.68, 0.04)], st);
+        }
+        Icon::Star(filled) => {
+            let ctr = at(0.5, 0.54);
+            let pts: Vec<Pos2> = (0..10)
+                .map(|i| {
+                    let a = -FRAC_PI_2 + i as f32 * PI / 5.0;
+                    let rad = if i % 2 == 0 { 0.46 } else { 0.19 } * s;
+                    ctr + vec2(a.cos(), a.sin()) * rad
+                })
+                .collect();
+            if filled {
+                // a star is not convex: fill it as a fan of triangles around the centre
+                for i in 0..10 {
+                    p.add(Shape::convex_polygon(vec![ctr, pts[i], pts[(i + 1) % 10]], c, Stroke::NONE));
+                }
+            } else {
+                p.add(Shape::closed_line(pts, Stroke::new(st.width * 0.85, c)));
+            }
+        }
+        Icon::User => {
+            p.circle_stroke(at(0.5, 0.32), 0.19 * s, st);
+            p.add(Shape::line(arc(at(0.5, 0.98), 0.4 * s, PI + 0.15, 2.0 * PI - 0.15, 16), st));
+        }
+        Icon::Comment => {
+            p.add(Shape::closed_line(
+                vec![at(0.1, 0.16), at(0.9, 0.16), at(0.9, 0.7), at(0.46, 0.7), at(0.24, 0.9), at(0.26, 0.7), at(0.1, 0.7)],
+                st,
+            ));
+        }
+        Icon::Login => {
+            p.add(Shape::line(vec![at(0.5, 0.12), at(0.88, 0.12), at(0.88, 0.88), at(0.5, 0.88)], st));
+            p.line_segment([at(0.1, 0.5), at(0.62, 0.5)], st);
+            p.add(Shape::line(vec![at(0.46, 0.32), at(0.64, 0.5), at(0.46, 0.68)], st));
+        }
+        Icon::Update => {
+            // arrow up out of a tray
+            p.line_segment([at(0.5, 0.66), at(0.5, 0.16)], st);
+            p.add(Shape::convex_polygon(vec![at(0.5, 0.04), at(0.76, 0.32), at(0.24, 0.32)], c, Stroke::NONE));
+            p.add(Shape::line(vec![at(0.1, 0.62), at(0.1, 0.9), at(0.9, 0.9), at(0.9, 0.62)], st));
         }
     }
 }

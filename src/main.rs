@@ -4,7 +4,9 @@ mod api;
 mod game;
 mod icons;
 mod installer;
+mod login;
 mod storage;
+mod updater;
 mod updates;
 
 use api::{Kind, Post, Sort};
@@ -15,8 +17,9 @@ use eframe::egui::{
 };
 use icons::Icon;
 use installer::{Installed, Manifest};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -62,8 +65,12 @@ const SETTINGS_FILE: &str = "settings.json";
 /// re-uploaded file (new link) is looked up again.
 const FILE_DATES_FILE: &str = "file_dates.json";
 const DATE_WORKERS: usize = 4;
+/// Downloads that run at the same time; the rest wait in the queue.
+const MAX_PARALLEL_DOWNLOADS: usize = 2;
+/// Finished downloads kept in the Downloads window.
+const HISTORY_LEN: usize = 40;
 /// Shown in the app and used for the release tag (Cargo needs the semver form "0.1.0-alpha").
-const APP_VERSION: &str = "0.1.1a";
+const APP_VERSION: &str = "0.2.0a";
 
 // ---------------------------------------------------------------------------------------------
 // App state
@@ -76,19 +83,87 @@ enum Msg {
     Detail(Result<Post, String>),
     Latest(Result<MajorUpdate, String>),
     FileDate { link: String, ts: Option<i64> },
+    UpdateCheck { manual: bool, result: Result<Option<updater::Release>, String> },
+    UpdateProgress { done: u64, total: Option<u64> },
+    UpdateInstalled(Result<PathBuf, String>),
+    Profile(u64, Result<api::Profile, String>),
+    UserPosts { user: u64, page: u32, result: Result<(Vec<Post>, bool), String> },
+    FollowingPosts { gen: u64, result: Result<(Vec<Post>, bool), String> },
+    Comments(u64, Result<Vec<api::Comment>, String>),
+    Liked(u64, Result<(u64, bool), String>),
+    CommentPosted(u64, Result<(), String>),
+    Login(Result<Option<login::Session>, String>),
+    /// Background check of a saved session: (user id the site sees, their profile).
+    SessionChecked(Result<(u64, Option<api::Profile>), String>),
 }
 
+/// A creator's page: profile header and their posts.
+struct CreatorPage {
+    id: u64,
+    nickname: String,
+    profile: Option<api::Profile>,
+    posts: Vec<Post>,
+    page: u32,
+    loading: bool,
+    end: bool,
+    err: Option<String>,
+}
+
+/// Comments of the post open in the detail window.
 #[derive(Default)]
+struct CommentsState {
+    lang_group: u64,
+    list: Vec<api::Comment>,
+    loading: bool,
+    err: Option<String>,
+    draft: String,
+    reply_to: Option<u64>,
+    sending: bool,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum JobState {
+    Queued,
+    Downloading,
+    Installing,
+}
+
+/// One entry of the download queue (waiting, downloading or installing).
 struct Job {
+    post: Post,
+    state: JobState,
     done: u64,
     total: Option<u64>,
-    installing: bool,
+    /// When the download started (egui time), for the speed display.
+    started: f64,
+    cancel: Arc<AtomicBool>,
+}
+
+/// A finished download, shown under "Finished" in the Downloads window.
+struct Finished {
+    post: Post,
+    /// `None` = installed, `Some(text)` = failed or cancelled.
+    error: Option<String>,
+    at: i64,
+}
+
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(updater::Release),
+    Downloading { release: updater::Release, done: u64, total: Option<u64> },
+    Ready { release: updater::Release, exe: PathBuf },
+    Failed(String),
 }
 
 #[derive(PartialEq, Clone, Copy)]
 enum View {
     Browse(Kind),
     Installed,
+    /// Newest posts from followed creators.
+    Following,
+    Creator(u64),
 }
 
 enum Action {
@@ -102,6 +177,22 @@ enum Action {
     /// `None` = War Thunder's default hangar.
     SetHangar(Option<String>),
     HangarChoice(u64, HangarChoice),
+    /// Cancel a queued or running download.
+    Cancel(u64),
+    ClearFinished,
+    InstallUpdate(updater::Release),
+    Restart(PathBuf),
+    OpenCreator(u64, String),
+    /// Follow / unfollow a creator (id, nickname, avatar).
+    ToggleFollow(u64, String, Option<String>),
+    Like(u64),
+    SendComment,
+    ReplyTo(Option<u64>),
+    Login,
+    Logout,
+    CreatorMore,
+    OpenFollowing,
+    ToggleHidden(u64, String),
 }
 
 #[derive(Clone, Copy)]
@@ -138,6 +229,32 @@ struct App {
     gen: u64,
 
     jobs: HashMap<u64, Job>,
+    /// Queue order of `jobs` (first in, first out).
+    job_order: Vec<u64>,
+    finished: VecDeque<Finished>,
+    downloads_open: bool,
+
+    update: UpdateState,
+    update_banner_hidden: bool,
+
+    bug_open: bool,
+    bug_title: String,
+    bug_text: String,
+    bug_include_errors: bool,
+    /// Recent error messages (for bug reports).
+    error_log: VecDeque<String>,
+
+    session: Option<login::Session>,
+    login_busy: bool,
+    /// Likes the user changed in this session: lang_group -> (likes, liked).
+    likes: HashMap<u64, (u64, bool)>,
+    like_busy: HashSet<u64>,
+    comments: CommentsState,
+    creator: Option<CreatorPage>,
+    following_posts: Vec<Post>,
+    following_loading: usize,
+    following_gen: u64,
+
     detail: Option<Post>,
     detail_image: usize,
     detail_loading: bool,
@@ -219,6 +336,25 @@ impl App {
             feed_err: None,
             gen: 0,
             jobs: HashMap::new(),
+            job_order: Vec::new(),
+            finished: VecDeque::new(),
+            downloads_open: false,
+            update: UpdateState::Idle,
+            update_banner_hidden: false,
+            bug_open: false,
+            bug_title: String::new(),
+            bug_text: String::new(),
+            bug_include_errors: true,
+            error_log: VecDeque::new(),
+            session: None,
+            login_busy: false,
+            likes: HashMap::new(),
+            like_busy: HashSet::new(),
+            comments: CommentsState::default(),
+            creator: None,
+            following_posts: Vec::new(),
+            following_loading: 0,
+            following_gen: 0,
             detail: None,
             detail_image: 0,
             detail_loading: false,
@@ -253,7 +389,415 @@ impl App {
         if app.settings.game_root.is_some() {
             app.reload();
         }
+        updater::cleanup_old();
+        app.check_updates(false);
+        if let Some(s) = login::load() {
+            app.use_session(s);
+        }
+        app.dev_start_screen();
         app
+    }
+
+    /// Development aid for screenshots: `WTAM_SCREEN=sound|following|creator:<id>|downloads|bug`.
+    fn dev_start_screen(&mut self) {
+        let Ok(screen) = std::env::var("WTAM_SCREEN") else { return };
+        let (what, arg) = screen.split_once(':').unwrap_or((screen.as_str(), ""));
+        match what {
+            "following" => {
+                self.view = View::Following;
+                self.load_following();
+            }
+            "creator" => self.open_creator(arg.parse().unwrap_or(0), String::new()),
+            "downloads" => self.downloads_open = true,
+            // the full post arrives via Msg::Detail
+            "detail" => self.open_detail(Post { lang_group: arg.parse().unwrap_or(0), ..Default::default() }),
+            "bug" => self.bug_open = true,
+            "installed" => self.view = View::Installed,
+            code => {
+                if let Some(kind) = Kind::from_code(code) {
+                    self.view = View::Browse(kind);
+                    self.reload();
+                }
+            }
+        }
+    }
+
+    // ---- account ------------------------------------------------------------------------------
+
+    /// Starts using a saved session and checks in the background that the site still accepts it.
+    fn use_session(&mut self, s: login::Session) {
+        api::set_session(Some(s.cookies.clone()));
+        self.session = Some(s);
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        thread::spawn(move || {
+            let result = api::whoami().map(|uid| (uid, if uid != 0 { api::fetch_profile(uid).ok() } else { None }));
+            let _ = tx.send(Msg::SessionChecked(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_login(&mut self) {
+        if self.login_busy {
+            return;
+        }
+        self.login_busy = true;
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        thread::spawn(move || {
+            let _ = tx.send(Msg::Login(login::run_child()));
+            ctx.request_repaint();
+        });
+    }
+
+    fn logout(&mut self) {
+        login::logout();
+        api::set_session(None);
+        self.session = None;
+        self.likes.clear();
+        self.toast("Logged out of live.warthunder.com.", false);
+    }
+
+    fn logged_in(&self) -> bool {
+        self.session.is_some()
+    }
+
+    // ---- creators -----------------------------------------------------------------------------
+
+    fn is_following(&self, id: u64) -> bool {
+        self.settings.favourite_authors.contains_key(&id)
+    }
+
+    fn toggle_follow(&mut self, id: u64, nickname: String, avatar: Option<String>) {
+        if id == 0 {
+            return;
+        }
+        if self.settings.favourite_authors.remove(&id).is_some() {
+            self.toast(format!("Unfollowed {nickname}."), false);
+        } else {
+            self.settings.favourite_authors.insert(id, storage::FavAuthor { nickname: nickname.clone(), avatar });
+            self.toast(format!("Following {nickname}. Their newest posts show up under Followed creators."), false);
+        }
+        self.save_settings();
+    }
+
+    fn open_creator(&mut self, id: u64, nickname: String) {
+        if id == 0 {
+            return;
+        }
+        self.detail = None;
+        self.view = View::Creator(id);
+        if self.creator.as_ref().is_some_and(|c| c.id == id) {
+            return;
+        }
+        self.creator = Some(CreatorPage { id, nickname, profile: None, posts: Vec::new(), page: 0, loading: false, end: false, err: None });
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        thread::spawn(move || {
+            let _ = tx.send(Msg::Profile(id, api::fetch_profile(id)));
+            ctx.request_repaint();
+        });
+        self.creator_more();
+    }
+
+    fn creator_more(&mut self) {
+        let Some(c) = self.creator.as_mut() else { return };
+        if c.loading || c.end {
+            return;
+        }
+        c.loading = true;
+        c.err = None;
+        let (user, page) = (c.id, c.page);
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        thread::spawn(move || {
+            let _ = tx.send(Msg::UserPosts { user, page, result: api::fetch_user_posts(user, page) });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Loads the first page of every followed creator and merges them, newest first.
+    fn load_following(&mut self) {
+        self.following_gen += 1;
+        self.following_posts.clear();
+        self.following_loading = self.settings.favourite_authors.len();
+        for &id in self.settings.favourite_authors.keys() {
+            let (tx, ctx, gen) = (self.tx.clone(), self.ctx.clone(), self.following_gen);
+            thread::spawn(move || {
+                let _ = tx.send(Msg::FollowingPosts { gen, result: api::fetch_user_posts(id, 0) });
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    // ---- likes and comments -------------------------------------------------------------------
+
+    fn likes_of(&self, p: &Post) -> (u64, Option<bool>) {
+        match self.likes.get(&p.lang_group) {
+            Some(&(n, liked)) => (n, Some(liked)),
+            None => (p.likes, None),
+        }
+    }
+
+    fn like(&mut self, lang_group: u64) {
+        if !self.logged_in() {
+            self.toast("Log in to live.warthunder.com to like posts (sidebar, bottom left).", true);
+            return;
+        }
+        if !self.like_busy.insert(lang_group) {
+            return;
+        }
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        thread::spawn(move || {
+            let _ = tx.send(Msg::Liked(lang_group, api::toggle_like(lang_group)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn load_comments(&mut self, p: &Post) {
+        let keep_draft = std::mem::take(&mut self.comments.draft);
+        let same = self.comments.lang_group == p.lang_group;
+        self.comments = CommentsState { lang_group: p.lang_group, loading: true, ..Default::default() };
+        if same {
+            self.comments.draft = keep_draft;
+        }
+        if p.id == 0 {
+            // Feed entries sometimes lack the language id; the full post (Msg::Detail) brings it.
+            return;
+        }
+        let (tx, ctx, id, lg) = (self.tx.clone(), self.ctx.clone(), p.id, p.lang_group);
+        thread::spawn(move || {
+            let _ = tx.send(Msg::Comments(lg, api::fetch_comments(id, lg)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn send_comment(&mut self) {
+        let Some(p) = self.detail.clone() else { return };
+        let text = self.comments.draft.trim().to_string();
+        if text.is_empty() || self.comments.sending || p.id == 0 {
+            return;
+        }
+        if !self.logged_in() {
+            self.toast("Log in to live.warthunder.com to comment.", true);
+            return;
+        }
+        self.comments.sending = true;
+        let reply = self.comments.reply_to;
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        thread::spawn(move || {
+            let _ = tx.send(Msg::CommentPosted(p.lang_group, api::post_comment(p.id, p.lang_group, &text, reply)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn hidden_by_filter(&self, p: &Post) -> bool {
+        let author = p.author.as_ref().map_or(0, |a| a.id);
+        // On a creator's own page their posts stay visible.
+        let on_their_page = self.view == View::Creator(author);
+        (!on_their_page && self.settings.hidden_authors.contains_key(&author)) || (self.settings.hide_anime && p.looks_anime())
+    }
+
+    fn toggle_hidden_author(&mut self, id: u64, nickname: String) {
+        if id == 0 {
+            return;
+        }
+        if self.settings.hidden_authors.remove(&id).is_some() {
+            self.toast(format!("Posts by {nickname} are shown again."), false);
+        } else {
+            self.settings.hidden_authors.insert(id, nickname.clone());
+            self.detail = None;
+            self.toast(format!("Posts by {nickname} are hidden. Undo this in Settings."), false);
+        }
+        self.save_settings();
+    }
+
+    // ---- app updates --------------------------------------------------------------------------
+
+    fn check_updates(&mut self, manual: bool) {
+        if matches!(self.update, UpdateState::Checking | UpdateState::Downloading { .. } | UpdateState::Ready { .. }) {
+            return;
+        }
+        self.update = UpdateState::Checking;
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        thread::spawn(move || {
+            let result = updater::check(APP_VERSION);
+            let _ = tx.send(Msg::UpdateCheck { manual, result });
+            ctx.request_repaint();
+        });
+    }
+
+    fn install_update(&mut self, release: updater::Release) {
+        if matches!(self.update, UpdateState::Downloading { .. } | UpdateState::Ready { .. }) {
+            return;
+        }
+        self.update = UpdateState::Downloading { release: release.clone(), done: 0, total: None };
+        self.update_banner_hidden = false;
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        thread::spawn(move || {
+            let result = updater::install(&release, |done, total| {
+                let _ = tx.send(Msg::UpdateProgress { done, total });
+                ctx.request_repaint();
+            });
+            let _ = tx.send(Msg::UpdateInstalled(result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Banner above the page while an app update is available, downloading or ready.
+    fn update_banner(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) -> bool {
+        let mut hide = false;
+        let (text, color) = match &self.update {
+            UpdateState::Available(r) => (format!("WT Armory Manager {} is available (you have {APP_VERSION}).", r.version), ACCENT),
+            UpdateState::Downloading { release, done, total } => {
+                let pct = total.filter(|t| *t > 0).map(|t| format!(" {:.0}%", *done as f64 * 100.0 / t as f64)).unwrap_or_default();
+                (format!("Downloading WT Armory Manager {}...{pct}", release.version), ACCENT)
+            }
+            UpdateState::Ready { release, .. } => (format!("WT Armory Manager {} is installed. Restart the app to use it.", release.version), SUCCESS),
+            _ => return false,
+        };
+        if self.update_banner_hidden {
+            return false;
+        }
+        Frame::none()
+            .fill(color.gamma_multiply(0.12))
+            .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.6)))
+            .rounding(8.0)
+            .inner_margin(Margin::symmetric(12.0, 8.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    icons::show(ui, Icon::Update, 18.0, color);
+                    ui.label(RichText::new(text).size(14.0).color(TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if button(ui, Some(Icon::Close), "", Color32::TRANSPARENT, MUTED, None, true).on_hover_text("Hide until next start").clicked() {
+                            hide = true;
+                        }
+                        match &self.update {
+                            UpdateState::Available(r) => {
+                                if button(ui, Some(Icon::External), "What's new", BTN, TEXT, None, true).clicked() {
+                                    actions.push(Action::OpenUrl(r.page.clone()));
+                                }
+                                if button(ui, Some(Icon::Download), "Install update", ACCENT, ON_ACCENT, None, true).clicked() {
+                                    actions.push(Action::InstallUpdate(r.clone()));
+                                }
+                            }
+                            UpdateState::Downloading { .. } => {
+                                ui.add(egui::Spinner::new().size(16.0).color(ACCENT));
+                            }
+                            UpdateState::Ready { release, exe } => {
+                                if button(ui, Some(Icon::External), "What's new", BTN, TEXT, None, true).clicked() {
+                                    actions.push(Action::OpenUrl(release.page.clone()));
+                                }
+                                let busy = self.jobs.values().any(|j| j.state != JobState::Queued);
+                                let r = button(ui, Some(Icon::Refresh), "Restart now", SUCCESS, Color32::from_rgb(0x08, 0x20, 0x10), None, !busy);
+                                if busy {
+                                    r.on_hover_text("Wait until the running downloads are finished");
+                                } else if r.clicked() {
+                                    actions.push(Action::Restart(exe.clone()));
+                                }
+                            }
+                            _ => {}
+                        }
+                    });
+                });
+            });
+        ui.add_space(10.0);
+        hide
+    }
+
+    // ---- bug reports --------------------------------------------------------------------------
+
+    fn log_error(&mut self, text: &str) {
+        let line = format!("[{}] {}", updates::fmt_date(now_ts()), redact(text));
+        self.error_log.push_back(line);
+        while self.error_log.len() > 15 {
+            self.error_log.pop_front();
+        }
+    }
+
+    /// The prefilled GitHub "new issue" page for the bug report form. Nothing is sent by the
+    /// app itself: the user reviews the text on GitHub and submits it there with their account.
+    fn bug_report_url(&self) -> String {
+        let game = self.game_version.clone().unwrap_or_else(|| "unknown".into());
+        let source = match self.settings.game_root.as_ref().map(|p| p.display().to_string().to_lowercase()) {
+            Some(p) if p.contains("steamapps") => "Steam",
+            Some(_) => "Gaijin launcher / other",
+            None => "not set",
+        };
+        let mut body = format!(
+            "### What happened?\n{}\n\n### Steps to reproduce\n1. \n\n### System\n- WT Armory Manager: {APP_VERSION}\n- Windows: {}\n- War Thunder: {game} ({source})\n- Installed items: {}\n",
+            if self.bug_text.trim().is_empty() { "<!-- Describe the problem -->" } else { self.bug_text.trim() },
+            windows_version(),
+            self.manifest.items.len(),
+        );
+        if self.bug_include_errors && !self.error_log.is_empty() {
+            body.push_str("\n### Recent errors\n```\n");
+            for line in &self.error_log {
+                body.push_str(&api::truncate(line, 300));
+                body.push('\n');
+            }
+            body.push_str("```\n");
+        }
+        let title = if self.bug_title.trim().is_empty() { "Bug: " } else { self.bug_title.trim() };
+        // Browsers and GitHub reject very long URLs; the body is what gets cut.
+        let mut body_enc = url_encode(&body);
+        while body_enc.len() > 6000 {
+            let keep = body.chars().count().saturating_sub(200);
+            body = body.chars().take(keep).collect();
+            body_enc = url_encode(&format!("{body}\n...(cut)"));
+        }
+        format!("https://github.com/{}/issues/new?labels=bug&title={}&body={}", updater::REPO, url_encode(title), body_enc)
+    }
+
+    fn bug_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        if !self.bug_open {
+            return;
+        }
+        let mut open = true;
+        let mut submit = false;
+        egui::Window::new(RichText::new("Report a bug").family(bold()).size(16.0).color(TEXT))
+            .id(egui::Id::new("bug_report"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                ui.label(muted("This opens a new issue on GitHub with your text and some system details filled in. You can check and change everything there before you submit it (you need a free GitHub account)."));
+                ui.add_space(8.0);
+                ui.label(RichText::new("Title").family(bold()).color(TEXT));
+                ui.add(egui::TextEdit::singleline(&mut self.bug_title).hint_text("e.g. Sound mod does not turn on").desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)));
+                ui.add_space(6.0);
+                ui.label(RichText::new("What happened?").family(bold()).color(TEXT));
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.bug_text)
+                        .hint_text("What did you do, what did you expect, and what happened instead?")
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(6)
+                        .margin(vec2(8.0, 6.0)),
+                );
+                ui.add_space(6.0);
+                let n = self.error_log.len();
+                ui.add_enabled(n > 0, egui::Checkbox::new(&mut self.bug_include_errors, RichText::new(format!("Include the last {n} error message(s) from this session")).color(TEXT)));
+                ui.label(muted(format!(
+                    "Always included: app version {APP_VERSION}, Windows version, War Thunder version and the number of installed items. Your user folder is replaced by %USERPROFILE%."
+                )));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if button(ui, Some(Icon::External), "Continue on GitHub", ACCENT, ON_ACCENT, None, true).clicked() {
+                        submit = true;
+                    }
+                    if button(ui, None, "See existing issues", BTN, TEXT, None, true).clicked() {
+                        actions.push(Action::OpenUrl(format!("https://github.com/{}/issues", updater::REPO)));
+                    }
+                });
+            });
+        if submit {
+            actions.push(Action::OpenUrl(self.bug_report_url()));
+            self.bug_open = false;
+            self.bug_title.clear();
+            self.bug_text.clear();
+            self.toast("The bug report opened in your browser. Submit it there.", false);
+        } else if !open {
+            self.bug_open = false;
+        }
     }
 
     // ---- hangars -------------------------------------------------------------------------------
@@ -451,6 +995,9 @@ impl App {
 
     fn toast(&mut self, text: impl Into<String>, error: bool) {
         let text = text.into();
+        if error {
+            self.log_error(&text);
+        }
         let now = self.ctx.input(|i| i.time);
         let until = now + 4.0 + text.len() as f64 / 22.0;
         self.toasts.push(Toast { text, error, until });
@@ -486,6 +1033,7 @@ impl App {
 
     fn open_detail(&mut self, post: Post) {
         let id = post.lang_group;
+        self.load_comments(&post);
         self.detail = Some(post);
         self.detail_image = 0;
         self.detail_loading = true;
@@ -522,12 +1070,65 @@ impl App {
                 }
                 Msg::Installing { id } => {
                     if let Some(job) = self.jobs.get_mut(&id) {
-                        job.installing = true;
+                        job.state = JobState::Installing;
+                    }
+                }
+                Msg::UpdateCheck { manual, result } => match result {
+                    Ok(Some(release)) => {
+                        // Debug builds never replace themselves (that would overwrite target\debug).
+                        let auto = self.settings.auto_update && !cfg!(debug_assertions);
+                        self.update = UpdateState::Available(release.clone());
+                        if auto {
+                            self.install_update(release);
+                        }
+                    }
+                    Ok(None) => {
+                        self.update = UpdateState::UpToDate;
+                        if manual {
+                            self.toast(format!("You have the latest version ({APP_VERSION})."), false);
+                        }
+                    }
+                    Err(e) => {
+                        if manual {
+                            self.toast(format!("Update check failed: {e}"), true);
+                        }
+                        self.update = UpdateState::Failed(e);
+                    }
+                },
+                Msg::UpdateProgress { done, total } => {
+                    if let UpdateState::Downloading { done: d, total: t, .. } = &mut self.update {
+                        *d = done;
+                        *t = total;
+                    }
+                }
+                Msg::UpdateInstalled(result) => {
+                    let release = match std::mem::replace(&mut self.update, UpdateState::Idle) {
+                        UpdateState::Downloading { release, .. } => Some(release),
+                        _ => None,
+                    };
+                    match (result, release) {
+                        (Ok(exe), Some(release)) => self.update = UpdateState::Ready { release, exe },
+                        (Err(e), release) => {
+                            self.toast(format!("Update failed: {e}"), true);
+                            self.update = match release {
+                                Some(r) => UpdateState::Available(r),
+                                None => UpdateState::Failed(e),
+                            };
+                        }
+                        (Ok(_), None) => {}
                     }
                 }
                 Msg::InstallDone { id, result } => {
-                    self.jobs.remove(&id);
+                    let post = self.jobs.remove(&id).map(|j| j.post);
+                    self.job_order.retain(|j| *j != id);
+                    if let Some(post) = post {
+                        let error = result.as_ref().err().cloned();
+                        self.finished.push_front(Finished { post, error, at: now_ts() });
+                        self.finished.truncate(HISTORY_LEN);
+                    }
+                    self.pump_queue();
                     match result {
+                        Err(e) if e == api::CANCELLED => {}
                         Ok(item) => {
                             let (title, note) = (item.title.clone(), item.note.clone());
                             let is_hangar = matches!(item.config, Some(installer::ConfigChange::Hangar { .. }));
@@ -556,26 +1157,178 @@ impl App {
                 }
                 Msg::Detail(result) => {
                     self.detail_loading = false;
+                    let mut reload_comments = None;
                     if let (Ok(full), Some(current)) = (result, self.detail.as_mut()) {
                         if current.lang_group == full.lang_group {
+                            if current.id == 0 && full.id != 0 {
+                                reload_comments = Some(full.clone());
+                            }
                             *current = full;
                         }
                     }
+                    if let Some(p) = reload_comments {
+                        self.load_comments(&p);
+                    }
                 }
+                Msg::Profile(id, result) => {
+                    if let Some(c) = self.creator.as_mut().filter(|c| c.id == id) {
+                        match result {
+                            Ok(p) => {
+                                c.nickname = p.nickname.clone();
+                                // keep the followed entry's name and picture current
+                                if let Some(f) = self.settings.favourite_authors.get_mut(&id) {
+                                    f.nickname = p.nickname.clone();
+                                    f.avatar = p.avatar.clone();
+                                }
+                                c.profile = Some(p);
+                            }
+                            Err(e) => c.err = Some(e),
+                        }
+                    }
+                }
+                Msg::UserPosts { user, page, result } => {
+                    if let Some(c) = self.creator.as_mut().filter(|c| c.id == user && c.page == page) {
+                        c.loading = false;
+                        match result {
+                            Ok((posts, more)) => {
+                                let seen: HashSet<u64> = c.posts.iter().map(|p| p.lang_group).collect();
+                                c.posts.extend(posts.into_iter().filter(|p| !seen.contains(&p.lang_group)));
+                                c.end = !more;
+                                c.page += 1;
+                            }
+                            Err(e) => c.err = Some(e),
+                        }
+                    }
+                }
+                Msg::FollowingPosts { gen, result } if gen == self.following_gen => {
+                    self.following_loading = self.following_loading.saturating_sub(1);
+                    if let Ok((posts, _)) = result {
+                        let seen: HashSet<u64> = self.following_posts.iter().map(|p| p.lang_group).collect();
+                        self.following_posts.extend(posts.into_iter().filter(|p| !seen.contains(&p.lang_group)));
+                        self.following_posts.sort_by(|a, b| b.created.cmp(&a.created));
+                    }
+                }
+                Msg::FollowingPosts { .. } => {}
+                Msg::Comments(lg, result) if lg == self.comments.lang_group => {
+                    self.comments.loading = false;
+                    match result {
+                        Ok(list) => self.comments.list = list,
+                        Err(e) => self.comments.err = Some(e),
+                    }
+                }
+                Msg::Comments(..) => {}
+                Msg::Liked(lg, result) => {
+                    self.like_busy.remove(&lg);
+                    match result {
+                        Ok(state) => {
+                            self.likes.insert(lg, state);
+                        }
+                        Err(e) => self.toast(format!("Could not like the post: {e}"), true),
+                    }
+                }
+                Msg::CommentPosted(lg, result) => {
+                    self.comments.sending = false;
+                    match result {
+                        Ok(()) => {
+                            self.toast("Comment posted.", false);
+                            if self.comments.lang_group == lg {
+                                self.comments.draft.clear();
+                                self.comments.reply_to = None;
+                                if let Some(p) = self.detail.clone() {
+                                    self.load_comments(&p);
+                                }
+                            }
+                        }
+                        Err(e) => self.toast(format!("Could not post the comment: {e}"), true),
+                    }
+                }
+                Msg::Login(result) => {
+                    self.login_busy = false;
+                    match result {
+                        Ok(Some(s)) => {
+                            self.toast("Logged in to live.warthunder.com.", false);
+                            self.use_session(s);
+                        }
+                        Ok(None) => {}
+                        Err(e) => self.toast(e, true),
+                    }
+                }
+                Msg::SessionChecked(result) => match result {
+                    Ok((0, _)) => {
+                        // The site no longer accepts the cookies.
+                        login::logout();
+                        api::set_session(None);
+                        self.session = None;
+                        self.toast("Your live.warthunder.com login has expired. Log in again to like and comment.", false);
+                    }
+                    Ok((uid, profile)) => {
+                        if let Some(s) = self.session.as_mut() {
+                            s.user_id = uid;
+                            if let Some(p) = profile {
+                                s.nickname = p.nickname;
+                                s.avatar = p.avatar;
+                            }
+                            let _ = login::save(s);
+                        }
+                    }
+                    Err(_) => {} // offline: keep the session and try again next start
+                },
             }
         }
     }
 
     // ---- install / uninstall ------------------------------------------------------------------
 
+    /// Adds a post to the download queue. At most `MAX_PARALLEL_DOWNLOADS` run at once, so a
+    /// dozen clicks don't split the bandwidth a dozen ways.
     fn start_install(&mut self, post: Post) {
-        let Some(root) = self.settings.game_root.clone() else { return };
         let id = post.lang_group;
-        if self.jobs.contains_key(&id) {
+        if self.settings.game_root.is_none() || self.jobs.contains_key(&id) {
             return;
         }
+        let job = Job { post, state: JobState::Queued, done: 0, total: None, started: 0.0, cancel: Arc::new(AtomicBool::new(false)) };
+        self.jobs.insert(id, job);
+        self.job_order.push(id);
+        self.pump_queue();
+    }
+
+    fn running_jobs(&self) -> usize {
+        self.jobs.values().filter(|j| j.state != JobState::Queued).count()
+    }
+
+    /// Starts queued downloads while there is a free slot.
+    fn pump_queue(&mut self) {
+        while self.running_jobs() < MAX_PARALLEL_DOWNLOADS {
+            let Some(id) = self.job_order.iter().copied().find(|id| self.jobs.get(id).is_some_and(|j| j.state == JobState::Queued)) else {
+                break;
+            };
+            self.run_job(id);
+        }
+    }
+
+    fn cancel_job(&mut self, id: u64) {
+        let Some(job) = self.jobs.get(&id) else { return };
+        match job.state {
+            JobState::Queued => {
+                let job = self.jobs.remove(&id).expect("checked above");
+                self.job_order.retain(|j| *j != id);
+                self.finished.push_front(Finished { post: job.post, error: Some(api::CANCELLED.into()), at: now_ts() });
+                self.finished.truncate(HISTORY_LEN);
+            }
+            // The worker notices the flag at its next progress report and answers with CANCELLED.
+            JobState::Downloading => job.cancel.store(true, Ordering::Relaxed),
+            JobState::Installing => {} // too late: files are being written
+        }
+    }
+
+    fn run_job(&mut self, id: u64) {
+        let Some(root) = self.settings.game_root.clone() else { return };
+        let now = self.ctx.input(|i| i.time);
+        let Some(job) = self.jobs.get_mut(&id) else { return };
+        job.state = JobState::Downloading;
+        job.started = now;
+        let (post, cancel) = (job.post.clone(), job.cancel.clone());
         let target = installer::Target { root, user_id: self.settings.user_id.clone() };
-        self.jobs.insert(id, Job::default());
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         thread::spawn(move || {
             let result = (|| -> Result<Installed, String> {
@@ -585,7 +1338,15 @@ impl App {
                 let file_date = api::download(&file.link, &dest, |done, total| {
                     let _ = tx.send(Msg::Progress { id, done, total });
                     ctx.request_repaint();
-                })?;
+                    !cancel.load(Ordering::Relaxed)
+                });
+                let file_date = match file_date {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&cache);
+                        return Err(e);
+                    }
+                };
                 let _ = tx.send(Msg::Installing { id });
                 ctx.request_repaint();
                 let result = installer::install(&post, &target, &dest, file_date);
@@ -683,6 +1444,14 @@ impl App {
                         if button(ui, Some(Icon::Gear), "Settings", BTN, TEXT, None, true).clicked() {
                             self.settings_open = !self.settings_open;
                         }
+                        let active = self.jobs.len();
+                        let r = button(ui, Some(Icon::Download), "Downloads", if active > 0 { ACCENT.gamma_multiply(0.25) } else { BTN }, TEXT, None, true);
+                        if active > 0 {
+                            badge(ui.painter(), r.rect.right_top() + vec2(4.0, -4.0), Align2::RIGHT_TOP, &active.to_string(), ACCENT, ON_ACCENT);
+                        }
+                        if r.on_hover_text("Running, waiting and finished downloads").clicked() {
+                            self.downloads_open = !self.downloads_open;
+                        }
                         ui.add_space(6.0);
                         if let Some(root) = &self.settings.game_root {
                             let label = egui::Label::new(muted(api::truncate(&root.display().to_string(), 64)))
@@ -697,8 +1466,9 @@ impl App {
             });
     }
 
-    fn sidebar(&mut self, ctx: &egui::Context) {
+    fn sidebar(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let mut new_view = None;
+        let mut account = None;
         egui::SidePanel::left("nav")
             .exact_width(222.0)
             .resizable(false)
@@ -716,17 +1486,54 @@ impl App {
                 if nav_item(ui, Icon::Library, "Installed", Some(count), self.view == View::Installed).clicked() {
                     new_view = Some(View::Installed);
                 }
+                let following = self.settings.favourite_authors.len();
+                let on_creators = matches!(self.view, View::Following | View::Creator(_));
+                if nav_item(ui, Icon::Star(false), "Followed creators", Some(following), on_creators).clicked() {
+                    new_view = Some(View::Following);
+                }
                 ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                     ui.label(RichText::new(format!("Version {APP_VERSION}")).size(11.0).color(MUTED.gamma_multiply(0.8)));
+                    ui.add_space(4.0);
+                    if nav_item(ui, Icon::Bug, "Report a bug", None, self.bug_open).clicked() {
+                        self.bug_open = !self.bug_open;
+                    }
+                    match &self.session {
+                        Some(s) => {
+                            let r = ui.add(egui::Label::new(RichText::new("Log out").size(12.0).color(MUTED)).sense(Sense::click()));
+                            if r.on_hover_text("Forget the live.warthunder.com login on this PC").clicked() {
+                                account = Some(Action::Logout);
+                            }
+                            let name = if s.nickname.is_empty() { "Logged in".to_string() } else { s.nickname.clone() };
+                            let me = View::Creator(s.user_id);
+                            if nav_item(ui, Icon::User, &name, None, self.view == me).on_hover_text("Your profile").clicked() {
+                                account = Some(Action::OpenCreator(s.user_id, name));
+                            }
+                        }
+                        None => {
+                            let text = if self.login_busy { "Logging in..." } else { "Log in" };
+                            if nav_item(ui, Icon::Login, text, None, self.login_busy)
+                                .on_hover_text("Log in to live.warthunder.com to like posts and write comments")
+                                .clicked()
+                            {
+                                account = Some(Action::Login);
+                            }
+                        }
+                    }
+                    ui.add_space(6.0);
                     ui.label(RichText::new("Content is made by the War Thunder community. Not affiliated with Gaijin Entertainment.").size(11.0).color(MUTED.gamma_multiply(0.8)));
                 });
             });
+        actions.extend(account);
         if let Some(view) = new_view {
             if view != self.view {
                 self.view = view;
-                if let View::Browse(_) = view {
-                    self.vehicle_type = "";
-                    self.reload();
+                match view {
+                    View::Browse(_) => {
+                        self.vehicle_type = "";
+                        self.reload();
+                    }
+                    View::Following => self.load_following(),
+                    _ => {}
                 }
             }
         }
@@ -767,6 +1574,13 @@ impl App {
                 .clicked()
             {
                 self.only_current = !self.only_current;
+            }
+            if chip(ui, "Hide anime", self.settings.hide_anime)
+                .on_hover_text("Hide anime and itasha skins (detected from hashtags like #anime, #itasha, #girls_und_panzer and franchise names)")
+                .clicked()
+            {
+                self.settings.hide_anime = !self.settings.hide_anime;
+                self.save_settings();
             }
         });
         ui.add_space(6.0);
@@ -816,6 +1630,7 @@ impl App {
             .posts
             .iter()
             .filter(|p| !self.only_current || self.compat_of(p) == Some(Compat::Current))
+            .filter(|p| !self.hidden_by_filter(p))
             .collect();
         let hidden = self.posts.len() - shown.len();
 
@@ -840,7 +1655,7 @@ impl App {
                 ui.add_space(4.0);
                 ui.vertical_centered(|ui| {
                     if hidden > 0 {
-                        ui.label(muted(format!("{hidden} older or still-checking item(s) hidden by the filter")));
+                        ui.label(muted(format!("{hidden} item(s) hidden by the filters")));
                     }
                     if self.loading {
                         ui.add(egui::Spinner::new().size(28.0).color(ACCENT));
@@ -923,9 +1738,21 @@ impl App {
                 Some(u) if u > p.created + 2 * 86_400 => format!("updated {}", ago(u)),
                 _ => ago(p.created),
             };
-            ui.add(egui::Label::new(muted(format!("by {}  ·  {when}", p.author_name()))).truncate().selectable(false));
             ui.horizontal(|ui| {
-                stat(ui, Icon::Heart, p.likes, "likes");
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.add(egui::Label::new(muted("by")).selectable(false));
+                author_link(ui, p, actions);
+                ui.add(egui::Label::new(muted(format!("·  {when}"))).truncate().selectable(false));
+            });
+            ui.horizontal(|ui| {
+                let (likes, liked) = self.likes_of(p);
+                if liked == Some(true) {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    icons::show(ui, Icon::Heart, 13.0, DANGER).on_hover_text("You like this");
+                    ui.label(RichText::new(compact(likes)).size(12.5).color(DANGER));
+                } else {
+                    stat(ui, Icon::Heart, likes, "likes");
+                }
                 ui.add_space(8.0);
                 stat(ui, Icon::Download, p.downloads, "downloads");
             });
@@ -944,23 +1771,14 @@ impl App {
     fn install_controls(&self, ui: &mut egui::Ui, p: &Post, width: f32, actions: &mut Vec<Action>) {
         let id = p.lang_group;
         if let Some(job) = self.jobs.get(&id) {
-            let frac = job.total.filter(|t| *t > 0).map(|t| job.done as f32 / t as f32);
-            let text = if job.installing {
-                "Installing...".to_string()
-            } else if let Some(f) = frac {
-                format!("Downloading  {:.0}%", f * 100.0)
-            } else {
-                format!("Downloading  {}", fmt_size(job.done))
-            };
-            ui.add(
-                egui::ProgressBar::new(if job.installing { 1.0 } else { frac.unwrap_or(0.0) })
-                    .desired_width(width)
-                    .desired_height(30.0)
-                    .fill(ACCENT.gamma_multiply(0.7))
-                    .rounding(6.0)
-                    .animate(job.installing || frac.is_none())
-                    .text(RichText::new(text).color(TEXT).size(13.0)),
-            );
+            ui.allocate_ui_with_layout(vec2(width, 30.0), Layout::right_to_left(Align::Center), |ui| {
+                let can_cancel = job.state != JobState::Installing;
+                if can_cancel && button(ui, Some(Icon::Close), "", BTN, TEXT, Some(32.0), true).on_hover_text("Cancel").clicked() {
+                    actions.push(Action::Cancel(id));
+                }
+                let w = ui.available_width();
+                self.job_progress(ui, job, w, 30.0);
+            });
         } else if let Some(item) = self.manifest.get(id) {
             let in_use = matches!(&item.config, Some(installer::ConfigChange::Hangar { value }) if self.hangar_active(value));
             ui.allocate_ui_with_layout(vec2(width, 30.0), Layout::left_to_right(Align::Center), |ui| {
@@ -979,6 +1797,161 @@ impl App {
         }
     }
 
+    fn queue_position(&self, id: u64) -> usize {
+        self.job_order.iter().filter(|j| self.jobs.get(j).is_some_and(|j| j.state == JobState::Queued)).position(|j| *j == id).map_or(0, |p| p + 1)
+    }
+
+    fn job_progress(&self, ui: &mut egui::Ui, job: &Job, width: f32, height: f32) {
+        let frac = job.total.filter(|t| *t > 0).map(|t| job.done as f32 / t as f32);
+        let now = ui.input(|i| i.time);
+        let text = match job.state {
+            JobState::Queued => format!("Waiting in queue  #{}", self.queue_position(job.post.lang_group)),
+            JobState::Installing => "Installing...".to_string(),
+            JobState::Downloading => {
+                let secs = (now - job.started).max(0.1);
+                let speed = if secs > 1.0 { format!("  ·  {}/s", fmt_size((job.done as f64 / secs) as u64)) } else { String::new() };
+                match frac {
+                    Some(f) => format!("{:.0}%{speed}", f * 100.0),
+                    None => format!("{}{speed}", fmt_size(job.done)),
+                }
+            }
+        };
+        let (value, animate, fill) = match job.state {
+            JobState::Queued => (0.0, false, BTN),
+            JobState::Installing => (1.0, true, ACCENT.gamma_multiply(0.7)),
+            JobState::Downloading => (frac.unwrap_or(0.0), frac.is_none(), ACCENT.gamma_multiply(0.7)),
+        };
+        ui.add(
+            egui::ProgressBar::new(value)
+                .desired_width(width)
+                .desired_height(height)
+                .fill(fill)
+                .rounding(6.0)
+                .animate(animate)
+                .text(RichText::new(text).color(TEXT).size(13.0)),
+        );
+    }
+
+    fn downloads_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        if !self.downloads_open {
+            return;
+        }
+        let mut open = true;
+        let screen = ctx.screen_rect();
+        egui::Window::new(RichText::new("Downloads").family(bold()).size(16.0).color(TEXT))
+            .id(egui::Id::new("downloads"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .default_height(520.0_f32.min(screen.height() - 120.0))
+            .max_height((screen.height() - 100.0).max(250.0))
+            .anchor(Align2::RIGHT_TOP, vec2(-18.0, 64.0))
+            .show(ctx, |ui| {
+                let running: Vec<&Job> = self.job_order.iter().filter_map(|id| self.jobs.get(id)).filter(|j| j.state != JobState::Queued).collect();
+                let queued: Vec<&Job> = self.job_order.iter().filter_map(|id| self.jobs.get(id)).filter(|j| j.state == JobState::Queued).collect();
+                ui.label(muted(format!("Up to {MAX_PARALLEL_DOWNLOADS} downloads run at the same time; the rest wait their turn.")));
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+                    section_label(ui, &format!("ACTIVE  ({})", running.len()));
+                    if running.is_empty() {
+                        ui.label(muted("Nothing is downloading."));
+                    }
+                    for job in &running {
+                        self.download_row(ui, &job.post, actions, |app, ui, w, actions| {
+                            let can_cancel = job.state != JobState::Installing;
+                            ui.horizontal(|ui| {
+                                app.job_progress(ui, job, w - if can_cancel { 40.0 } else { 0.0 }, 24.0);
+                                if can_cancel && button(ui, Some(Icon::Close), "", BTN, TEXT, Some(32.0), true).on_hover_text("Cancel").clicked() {
+                                    actions.push(Action::Cancel(job.post.lang_group));
+                                }
+                            });
+                        });
+                    }
+                    if !queued.is_empty() {
+                        ui.add_space(8.0);
+                        section_label(ui, &format!("WAITING  ({})", queued.len()));
+                        for job in &queued {
+                            self.download_row(ui, &job.post, actions, |app, ui, w, actions| {
+                                ui.horizontal(|ui| {
+                                    app.job_progress(ui, job, w - 40.0, 24.0);
+                                    if button(ui, Some(Icon::Close), "", BTN, TEXT, Some(32.0), true).on_hover_text("Remove from the queue").clicked() {
+                                        actions.push(Action::Cancel(job.post.lang_group));
+                                    }
+                                });
+                            });
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        section_label(ui, &format!("FINISHED  ({})", self.finished.len()));
+                        if !self.finished.is_empty() {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.add(egui::Label::new(RichText::new("Clear").size(12.5).color(ACCENT)).sense(Sense::click())).clicked() {
+                                    actions.push(Action::ClearFinished);
+                                }
+                            });
+                        }
+                    });
+                    if self.finished.is_empty() {
+                        ui.label(muted("Finished downloads show up here."));
+                    }
+                    for f in &self.finished {
+                        self.download_row(ui, &f.post, actions, |app, ui, _w, actions| {
+                            ui.horizontal(|ui| {
+                                match &f.error {
+                                    None => {
+                                        icons::show(ui, Icon::Check, 14.0, SUCCESS);
+                                        ui.label(RichText::new("Installed").size(13.0).color(SUCCESS));
+                                    }
+                                    Some(e) if e == api::CANCELLED => {
+                                        ui.label(RichText::new("Cancelled").size(13.0).color(MUTED));
+                                    }
+                                    Some(e) => {
+                                        icons::show(ui, Icon::Close, 14.0, DANGER);
+                                        ui.add(egui::Label::new(RichText::new(e).size(12.5).color(DANGER)).truncate()).on_hover_text(e);
+                                    }
+                                }
+                                ui.label(muted(format!("·  {}", ago(f.at))));
+                                let installed = app.manifest.get(f.post.lang_group).is_some();
+                                if f.error.is_some() && !installed && !app.jobs.contains_key(&f.post.lang_group) {
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if button(ui, Some(Icon::Refresh), "Retry", BTN, TEXT, None, true).clicked() {
+                                            actions.push(Action::Install(f.post.clone()));
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                    }
+                });
+            });
+        if !open {
+            self.downloads_open = false;
+        }
+    }
+
+    /// One row of the Downloads window: thumbnail, title and a status line drawn by `status`.
+    fn download_row(&self, ui: &mut egui::Ui, p: &Post, actions: &mut Vec<Action>, status: impl FnOnce(&Self, &mut egui::Ui, f32, &mut Vec<Action>)) {
+        ui.horizontal(|ui| {
+            let (r, resp) = ui.allocate_exact_size(vec2(84.0, 47.0), Sense::click());
+            let kind = p.kind().unwrap_or(Kind::Camouflage);
+            paint_thumb(ui, p, kind, r, Rounding::same(4.0));
+            if resp.on_hover_text("Show details").clicked() {
+                actions.push(Action::Detail(p.clone()));
+            }
+            ui.vertical(|ui| {
+                let w = ui.available_width();
+                ui.horizontal(|ui| {
+                    icons::show(ui, Icon::Kind(kind), 13.0, ACCENT);
+                    ui.add(egui::Label::new(RichText::new(p.title()).family(bold()).size(14.0).color(TEXT)).truncate());
+                });
+                status(self, ui, w, actions);
+            });
+        });
+        ui.add_space(6.0);
+    }
+
     fn installed_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             icons::show(ui, Icon::Library, 24.0, ACCENT);
@@ -989,7 +1962,10 @@ impl App {
         self.hangar_panel(ui, actions);
 
         if !self.jobs.is_empty() {
-            ui.label(muted(format!("{} download(s) in progress...", self.jobs.len())));
+            let text = RichText::new(format!("{} download(s) running or waiting. Open Downloads", self.jobs.len())).size(12.5).color(ACCENT);
+            if ui.add(egui::Label::new(text).sense(Sense::click())).clicked() {
+                self.downloads_open = true;
+            }
             ui.add_space(6.0);
         }
         if self.manifest.items.is_empty() {
@@ -1120,10 +2096,47 @@ impl App {
                     }
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(p.author_name()).family(bold()).color(TEXT));
+                        let author = p.author.clone().unwrap_or_default();
+                        let pic = author.avatar_url();
+                        if avatar(ui, pic.as_deref(), 28.0).clicked() && author.id != 0 {
+                            actions.push(Action::OpenCreator(author.id, author.nickname.clone()));
+                        }
+                        author_link(ui, &p, actions);
+                        if author.id != 0 {
+                            let following = self.is_following(author.id);
+                            let r = button(ui, Some(Icon::Star(following)), if following { "Following" } else { "Follow" }, BTN, if following { ACCENT } else { TEXT }, None, true);
+                            if r.on_hover_text(if following { "Stop following this creator" } else { "Follow this creator (kept in the app)" }).clicked() {
+                                actions.push(Action::ToggleFollow(author.id, author.nickname.clone(), pic.clone()));
+                            }
+                        }
                         ui.label(muted(ago(p.created)));
                         ui.add_space(10.0);
-                        stat(ui, Icon::Heart, p.likes, "likes");
+                        let (likes, liked) = self.likes_of(&p);
+                        let liked = liked == Some(true);
+                        let busy = self.like_busy.contains(&p.lang_group);
+                        let r = button(
+                            ui,
+                            Some(Icon::Heart),
+                            &compact(likes),
+                            if liked { DANGER_BG } else { BTN },
+                            if liked { DANGER } else { TEXT },
+                            None,
+                            !busy,
+                        );
+                        let tip = match (self.logged_in(), liked) {
+                            (false, _) => "Log in (bottom left) to like posts",
+                            (true, true) => "You like this. Click to take the like back",
+                            (true, false) => "Like this post",
+                        };
+                        if r.on_hover_text(tip).clicked() {
+                            actions.push(Action::Like(p.lang_group));
+                        }
+                        if author.id != 0 && !self.is_following(author.id) {
+                            let r = ui.add(egui::Label::new(RichText::new("Hide creator").size(12.5).color(MUTED)).sense(Sense::click()));
+                            if r.on_hover_text("Never show posts by this creator in the feeds (e.g. anime skins the filter misses)").clicked() {
+                                actions.push(Action::ToggleHidden(author.id, author.nickname.clone()));
+                            }
+                        }
                         ui.add_space(6.0);
                         stat(ui, Icon::Download, p.downloads, "downloads");
                         ui.add_space(6.0);
@@ -1191,11 +2204,234 @@ impl App {
                             }
                         });
                     }
+                    ui.add_space(12.0);
+                    ui.separator();
+                    self.comments_section(ui, &p, actions);
                 });
             });
         if !open {
             self.detail = None;
         }
+    }
+
+    fn comments_section(&mut self, ui: &mut egui::Ui, p: &Post, actions: &mut Vec<Action>) {
+        let c = &self.comments;
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            icons::show(ui, Icon::Comment, 16.0, ACCENT);
+            let n = if c.loading { p.comments as usize } else { c.list.len() };
+            ui.label(RichText::new(format!("Comments ({n})")).family(bold()).size(15.0).color(TEXT));
+            if c.loading {
+                ui.add(egui::Spinner::new().size(14.0).color(ACCENT));
+            }
+        });
+        ui.add_space(4.0);
+
+        // Write box (or the way to log in).
+        if self.logged_in() {
+            if let Some(rid) = self.comments.reply_to {
+                let who = self.comments.list.iter().find(|x| x.id == rid).and_then(|x| x.author.as_ref()).map(|a| a.nickname.clone()).unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label(muted(format!("Replying to {who}")));
+                    if ui.add(egui::Label::new(RichText::new("Cancel").size(12.5).color(ACCENT)).sense(Sense::click())).clicked() {
+                        actions.push(Action::ReplyTo(None));
+                    }
+                });
+            }
+            ui.add(
+                egui::TextEdit::multiline(&mut self.comments.draft)
+                    .hint_text("Write a comment...")
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .margin(vec2(8.0, 6.0)),
+            );
+            ui.horizontal(|ui| {
+                let can = !self.comments.draft.trim().is_empty() && !self.comments.sending && p.id != 0;
+                let label = if self.comments.sending { "Sending..." } else { "Post comment" };
+                if button(ui, Some(Icon::Comment), label, ACCENT, ON_ACCENT, None, can).clicked() {
+                    actions.push(Action::SendComment);
+                }
+                ui.label(muted("Posted on live.warthunder.com under your account."));
+            });
+        } else {
+            ui.horizontal(|ui| {
+                if button(ui, Some(Icon::Login), "Log in to comment", BTN, TEXT, None, !self.login_busy).clicked() {
+                    actions.push(Action::Login);
+                }
+            });
+        }
+        ui.add_space(8.0);
+
+        let c = &self.comments;
+        if let Some(e) = &c.err {
+            ui.label(RichText::new(e).color(DANGER));
+        } else if !c.loading && c.list.is_empty() {
+            ui.label(muted("No comments yet."));
+        }
+        // Top-level comments, oldest first, each followed by its replies.
+        let ids: HashSet<u64> = c.list.iter().map(|x| x.id).collect();
+        let mut top: Vec<&api::Comment> = c.list.iter().filter(|x| x.parent == 0 || !ids.contains(&x.parent)).collect();
+        top.sort_by_key(|x| x.created);
+        let logged_in = self.logged_in();
+        for t in top {
+            comment_row(ui, t, 0.0, logged_in, actions);
+            let mut replies: Vec<&api::Comment> = c.list.iter().filter(|x| x.parent == t.id).collect();
+            replies.sort_by_key(|x| x.created);
+            for r in replies {
+                comment_row(ui, r, 34.0, logged_in, actions);
+            }
+        }
+    }
+
+    fn creator_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let Some(c) = &self.creator else { return };
+        let profile = c.profile.clone();
+        let (id, nickname) = (c.id, c.nickname.clone());
+        let pic = profile.as_ref().and_then(|p| p.avatar.clone());
+        ui.horizontal(|ui| {
+            if button(ui, None, "Back", BTN, TEXT, None, true).on_hover_text("Followed creators").clicked() {
+                actions.push(Action::OpenFollowing);
+            }
+            ui.add_space(6.0);
+            avatar(ui, pic.as_deref(), 52.0);
+            ui.vertical(|ui| {
+                ui.label(RichText::new(&nickname).family(bold()).size(23.0).color(TEXT));
+                match &profile {
+                    Some(p) => {
+                        ui.label(muted(format!(
+                            "{} posts  ·  {} comments  ·  {} subscribers  ·  reputation {}",
+                            compact(p.posts),
+                            compact(p.comments),
+                            compact(p.subscribers),
+                            compact(p.reputation)
+                        )));
+                    }
+                    None => {
+                        ui.label(muted("Loading profile..."));
+                    }
+                }
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if button(ui, Some(Icon::External), "Open profile on website", BTN, TEXT, None, true).clicked() {
+                    actions.push(Action::OpenUrl(api::Profile::url(id)));
+                }
+                let following = self.is_following(id);
+                if button(ui, Some(Icon::Star(following)), if following { "Following" } else { "Follow" }, if following { BTN } else { ACCENT }, if following { ACCENT } else { ON_ACCENT }, None, true)
+                    .on_hover_text(if following { "Stop following" } else { "Show this creator's newest posts under Followed creators" })
+                    .clicked()
+                {
+                    actions.push(Action::ToggleFollow(id, nickname.clone(), pic.clone()));
+                }
+            });
+        });
+        ui.add_space(12.0);
+        let c = self.creator.as_ref().expect("checked above");
+        let posts: Vec<Post> = c.posts.iter().filter(|p| !self.hidden_by_filter(p)).cloned().collect();
+        let hidden = c.posts.len() - posts.len();
+        let (loading, end, err) = (c.loading, c.end, c.err.clone());
+        let more = self.post_grid(ui, ("creator", id), &posts, actions, |ui| {
+            if hidden > 0 {
+                ui.label(muted(format!("{hidden} item(s) hidden by the anime filter")));
+            }
+            if let Some(e) = &err {
+                ui.label(RichText::new(e).color(DANGER));
+            }
+            if loading {
+                ui.add(egui::Spinner::new().size(28.0).color(ACCENT));
+                false
+            } else if end || err.is_some() {
+                ui.label(muted(if posts.is_empty() && hidden == 0 { "This creator has no installable posts." } else { "That's everything." }));
+                false
+            } else {
+                let r = button(ui, None, "Load more", BTN, TEXT, None, true);
+                r.clicked() || ui.is_rect_visible(r.rect)
+            }
+        });
+        if more {
+            actions.push(Action::CreatorMore);
+        }
+    }
+
+    fn following_view(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            icons::show(ui, Icon::Star(true), 24.0, ACCENT);
+            ui.label(RichText::new("Followed creators").family(bold()).size(23.0).color(TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if button(ui, Some(Icon::Refresh), "", BTN, TEXT, None, true).on_hover_text("Refresh").clicked() {
+                    actions.push(Action::OpenFollowing);
+                }
+            });
+        });
+        ui.label(muted("Creators you follow and their newest posts. Click a creator's name anywhere in the app to see their profile and follow them."));
+        ui.add_space(10.0);
+        if self.settings.favourite_authors.is_empty() {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("You don't follow anyone yet").family(bold()).size(17.0).color(TEXT));
+                ui.label(muted("Open a post, then press Follow next to the creator's name."));
+            });
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            for (&id, fav) in &self.settings.favourite_authors {
+                let r = Frame::none()
+                    .fill(CARD)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .rounding(20.0)
+                    .inner_margin(Margin { left: 4.0, right: 12.0, top: 4.0, bottom: 4.0 })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            avatar(ui, fav.avatar.as_deref(), 28.0);
+                            ui.label(RichText::new(&fav.nickname).size(13.5).color(TEXT));
+                        });
+                    })
+                    .response
+                    .interact(Sense::click());
+                if r.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if r.on_hover_text("Open profile").clicked() {
+                    actions.push(Action::OpenCreator(id, fav.nickname.clone()));
+                }
+            }
+        });
+        ui.add_space(12.0);
+        section_label(ui, "NEWEST POSTS");
+        let posts: Vec<Post> = self.following_posts.iter().filter(|p| !self.hidden_by_filter(p)).cloned().collect();
+        let loading = self.following_loading > 0;
+        let gen = self.following_gen;
+        self.post_grid(ui, ("following", gen), &posts, actions, |ui| {
+            if loading {
+                ui.add(egui::Spinner::new().size(28.0).color(ACCENT));
+            } else if posts.is_empty() {
+                ui.label(muted("No installable posts from these creators."));
+            }
+            false
+        });
+    }
+
+    /// A scrolling grid of post cards. `footer` draws below the cards and returns true to ask
+    /// for more posts (infinite scroll).
+    fn post_grid(&self, ui: &mut egui::Ui, id: impl std::hash::Hash, posts: &[Post], actions: &mut Vec<Action>, footer: impl FnOnce(&mut egui::Ui) -> bool) -> bool {
+        let mut more = false;
+        egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
+            let gap = 14.0;
+            let avail = ui.available_width() - 6.0;
+            let cols = (((avail + gap) / (250.0 + gap)).floor() as usize).max(1);
+            let card_w = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).floor();
+            for row in posts.chunks(cols) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for post in row {
+                        self.card(ui, post, card_w, actions);
+                    }
+                });
+                ui.add_space(gap);
+            }
+            ui.vertical_centered(|ui| more = footer(ui));
+            ui.add_space(24.0);
+        });
+        more
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -1204,12 +2440,47 @@ impl App {
         }
         let mut open = true;
         let mut pick = false;
+        let mut check = false;
+        let mut install = None;
         egui::Window::new(RichText::new("Settings").family(bold()).size(16.0).color(TEXT))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .default_width(540.0)
             .show(ctx, |ui| {
+                ui.label(RichText::new("App updates").family(bold()).color(TEXT));
+                ui.horizontal(|ui| {
+                    ui.label(muted(format!("You have version {APP_VERSION}.")));
+                    let status = match &self.update {
+                        UpdateState::Idle => String::new(),
+                        UpdateState::Checking => "Checking...".into(),
+                        UpdateState::UpToDate => "This is the latest version.".into(),
+                        UpdateState::Available(r) => format!("Version {} is available.", r.version),
+                        UpdateState::Downloading { release, .. } => format!("Downloading {}...", release.version),
+                        UpdateState::Ready { release, .. } => format!("{} is installed; restart to use it.", release.version),
+                        UpdateState::Failed(e) => format!("Last check failed: {}", api::truncate(e, 70)),
+                    };
+                    let color = if matches!(self.update, UpdateState::Failed(_)) { DANGER } else { TEXT };
+                    ui.label(RichText::new(status).size(12.5).color(color));
+                });
+                ui.horizontal(|ui| {
+                    let busy = matches!(self.update, UpdateState::Checking | UpdateState::Downloading { .. });
+                    if button(ui, Some(Icon::Refresh), "Check for updates", BTN, TEXT, None, !busy).clicked() {
+                        check = true;
+                    }
+                    if let UpdateState::Available(r) = &self.update {
+                        if button(ui, Some(Icon::Download), "Install update", ACCENT, ON_ACCENT, None, true).clicked() {
+                            install = Some(r.clone());
+                        }
+                    }
+                });
+                if ui
+                    .checkbox(&mut self.settings.auto_update, RichText::new("Install updates automatically (checked at every start)").color(TEXT))
+                    .changed()
+                {
+                    self.save_settings();
+                }
+                ui.add_space(14.0);
                 ui.label(RichText::new("War Thunder folder").family(bold()).color(TEXT));
                 let root = self.settings.game_root.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                 ui.label(muted(root));
@@ -1231,6 +2502,33 @@ impl App {
                     }
                 }
                 ui.add_space(14.0);
+                ui.label(RichText::new("Content filter").family(bold()).color(TEXT));
+                if ui
+                    .checkbox(&mut self.settings.hide_anime, RichText::new("Hide anime and itasha skins").color(TEXT))
+                    .on_hover_text("Detected from hashtags and franchise names in the description, so posts without them can slip through")
+                    .changed()
+                {
+                    self.save_settings();
+                }
+                if self.settings.hidden_authors.is_empty() {
+                    ui.label(muted("Hidden creators: none. Use \"Hide creator\" in a post to add one."));
+                } else {
+                    ui.label(muted("Hidden creators (click to show their posts again):"));
+                    let mut unhide = None;
+                    ui.horizontal_wrapped(|ui| {
+                        for (&id, name) in &self.settings.hidden_authors {
+                            if chip(ui, name, false).on_hover_text("Show this creator again").clicked() {
+                                unhide = Some((id, name.clone()));
+                            }
+                        }
+                    });
+                    if let Some((id, name)) = unhide {
+                        self.settings.hidden_authors.remove(&id);
+                        self.save_settings();
+                        self.toast(format!("Posts by {name} are shown again."), false);
+                    }
+                }
+                ui.add_space(14.0);
                 ui.label(RichText::new("Backups").family(bold()).color(TEXT));
                 ui.label(muted("A copy of config.blk is saved before every change (the last 15 are kept). Files that an install replaces are kept until you uninstall it."));
                 ui.horizontal(|ui| {
@@ -1248,6 +2546,12 @@ impl App {
             });
         if pick && self.pick_game_folder() {
             self.toast("War Thunder folder changed", false);
+        }
+        if check {
+            self.check_updates(true);
+        }
+        if let Some(r) = install {
+            self.install_update(r);
         }
         if !open {
             self.settings_open = false;
@@ -1331,15 +2635,24 @@ impl eframe::App for App {
         }
         let mut actions = Vec::new();
         self.top_bar(ctx, &mut actions);
-        self.sidebar(ctx);
+        self.sidebar(ctx, &mut actions);
         egui::CentralPanel::default()
             .frame(Frame::none().fill(BG).inner_margin(Margin { left: 22.0, right: 16.0, top: 16.0, bottom: 0.0 }))
-            .show(ctx, |ui| match self.view {
-                View::Browse(kind) => self.browse(ui, kind, &mut actions),
-                View::Installed => self.installed_view(ui, &mut actions),
+            .show(ctx, |ui| {
+                if self.update_banner(ui, &mut actions) {
+                    self.update_banner_hidden = true;
+                }
+                match self.view {
+                    View::Browse(kind) => self.browse(ui, kind, &mut actions),
+                    View::Installed => self.installed_view(ui, &mut actions),
+                    View::Following => self.following_view(ui, &mut actions),
+                    View::Creator(_) => self.creator_view(ui, &mut actions),
+                }
             });
         self.detail_window(ctx, &mut actions);
         self.settings_window(ctx);
+        self.downloads_window(ctx, &mut actions);
+        self.bug_window(ctx, &mut actions);
         self.hangar_prompt_window(ctx, &mut actions);
 
         for action in actions {
@@ -1372,6 +2685,26 @@ impl eframe::App for App {
                         HangarChoice::Remove => self.uninstall(id),
                     }
                 }
+                Action::OpenCreator(id, name) => self.open_creator(id, name),
+                Action::ToggleFollow(id, name, avatar) => self.toggle_follow(id, name, avatar),
+                Action::Like(lg) => self.like(lg),
+                Action::SendComment => self.send_comment(),
+                Action::ReplyTo(r) => self.comments.reply_to = r,
+                Action::Login => self.start_login(),
+                Action::Logout => self.logout(),
+                Action::CreatorMore => self.creator_more(),
+                Action::ToggleHidden(id, name) => self.toggle_hidden_author(id, name),
+                Action::OpenFollowing => {
+                    self.view = View::Following;
+                    self.load_following();
+                }
+                Action::Cancel(id) => self.cancel_job(id),
+                Action::ClearFinished => self.finished.clear(),
+                Action::InstallUpdate(r) => self.install_update(r),
+                Action::Restart(exe) => match updater::restart(&exe) {
+                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(e) => self.toast(e, true),
+                },
             }
         }
         self.save_file_dates_if_needed();
@@ -1517,6 +2850,66 @@ fn compat_style(compat: Compat, kind: Kind, majors: &[MajorUpdate]) -> (String, 
     }
 }
 
+fn comment_row(ui: &mut egui::Ui, c: &api::Comment, indent: f32, logged_in: bool, actions: &mut Vec<Action>) {
+    ui.horizontal_top(|ui| {
+        ui.add_space(indent);
+        let a = c.author.clone().unwrap_or_default();
+        if avatar(ui, a.avatar_url().as_deref(), 28.0).clicked() && a.id != 0 {
+            actions.push(Action::OpenCreator(a.id, a.nickname.clone()));
+        }
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                let name = if a.nickname.is_empty() { "unknown" } else { a.nickname.as_str() };
+                let r = ui.add(egui::Label::new(RichText::new(name).family(bold()).size(13.0).color(TEXT)).sense(Sense::click()));
+                if r.clicked() && a.id != 0 {
+                    actions.push(Action::OpenCreator(a.id, a.nickname.clone()));
+                }
+                ui.label(muted(ago(c.created)));
+                if c.rating != 0 {
+                    ui.label(muted(format!("{:+}", c.rating)));
+                }
+                if logged_in && ui.add(egui::Label::new(RichText::new("Reply").size(12.5).color(ACCENT)).sense(Sense::click())).clicked() {
+                    actions.push(Action::ReplyTo(Some(if c.parent == 0 { c.id } else { c.parent })));
+                }
+            });
+            ui.add(egui::Label::new(RichText::new(api::html_to_text(&c.text).trim()).size(13.5).color(TEXT)).wrap());
+        });
+    });
+    ui.add_space(6.0);
+}
+
+/// The post's author as a link to their creator page.
+fn author_link(ui: &mut egui::Ui, p: &Post, actions: &mut Vec<Action>) {
+    let Some(a) = p.author.as_ref().filter(|a| a.id != 0) else {
+        ui.add(egui::Label::new(muted(p.author_name())).selectable(false));
+        return;
+    };
+    let r = ui.add(egui::Label::new(RichText::new(p.author_name()).size(12.5).color(TEXT.gamma_multiply(0.9))).sense(Sense::click()).truncate().selectable(false));
+    let r = if r.hovered() {
+        ui.painter().hline(r.rect.x_range(), r.rect.bottom(), Stroke::new(1.0_f32, ACCENT));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        r.on_hover_text("Show this creator's profile and other mods")
+    } else {
+        r
+    };
+    if r.clicked() {
+        actions.push(Action::OpenCreator(a.id, a.nickname.clone()));
+    }
+}
+
+/// A round avatar picture (or a drawn placeholder).
+fn avatar(ui: &mut egui::Ui, url: Option<&str>, size: f32) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    ui.painter().circle_filled(r.center(), size / 2.0, BTN);
+    match url {
+        Some(u) => {
+            egui::Image::new(u).rounding(size / 2.0).paint_at(ui, r);
+        }
+        None => icons::paint(ui.painter(), r.shrink(size * 0.22), Icon::User, MUTED),
+    }
+    resp
+}
+
 fn stat(ui: &mut egui::Ui, icon: Icon, n: u64, what: &str) {
     ui.spacing_mut().item_spacing.x = 4.0;
     icons::show(ui, icon, 13.0, MUTED).on_hover_text(format!("{n} {what}"));
@@ -1579,6 +2972,71 @@ fn ago(ts: i64) -> String {
         2_592_000..=31_535_999 => plural(s / 2_592_000, "month"),
         _ => plural(s / 31_536_000, "year"),
     }
+}
+
+fn now_ts() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Percent-encodes everything except unreserved characters (RFC 3986), for URL query values.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Replaces the user's home folder (it contains their Windows user name) in text meant for others.
+fn redact(text: &str) -> String {
+    let Some(home) = dirs::home_dir() else { return text.to_string() };
+    let home = home.display().to_string();
+    if home.len() < 4 {
+        return text.to_string();
+    }
+    // Case-insensitive, like Windows paths.
+    let lower = text.to_lowercase();
+    let needle = home.to_lowercase();
+    let mut out = String::new();
+    let mut last = 0;
+    for (i, _) in lower.match_indices(&needle) {
+        if text.is_char_boundary(i) && text.is_char_boundary(i + needle.len()) {
+            out.push_str(&text[last..i]);
+            out.push_str("%USERPROFILE%");
+            last = i + needle.len();
+        }
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// "Windows 11 (build 26200)" from the registry, read once.
+fn windows_version() -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let query = |name: &str| -> Option<String> {
+                let mut cmd = std::process::Command::new("reg");
+                cmd.args(["query", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion", "/v", name]);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                }
+                let out = cmd.output().ok()?;
+                let text = String::from_utf8_lossy(&out.stdout).to_string();
+                text.lines().find(|l| l.contains(name))?.split("REG_SZ").nth(1).map(|s| s.trim().to_string())
+            };
+            let build: u32 = query("CurrentBuildNumber").and_then(|b| b.parse().ok()).unwrap_or(0);
+            let display = query("DisplayVersion").unwrap_or_default();
+            // The registry still says "Windows 10" on Windows 11; the build number tells them apart.
+            let name = if build >= 22000 { "Windows 11" } else if build > 0 { "Windows 10" } else { "Windows" };
+            format!("{name} {display} (build {build})").replace("  ", " ")
+        })
+        .clone()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1670,6 +3128,9 @@ fn app_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result<()> {
+    if std::env::args().any(|a| a == login::ARG) {
+        login::window_main();
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("WT Armory Manager")

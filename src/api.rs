@@ -12,7 +12,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 pub const BASE: &str = "https://live.warthunder.com";
-const USER_AGENT: &str = "WT-Armory-Manager/0.1 (desktop client)";
+pub const USER_AGENT: &str = concat!("WT-Armory-Manager/", env!("CARGO_PKG_VERSION"), " (desktop client)");
+/// Error text of a download the user cancelled.
+pub const CANCELLED: &str = "Cancelled";
 
 /// The installable content types of live.warthunder.com. Hangars are published as "location" posts.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
@@ -142,6 +144,19 @@ pub struct Author {
     pub id: u64,
     #[serde(default, deserialize_with = "de_string")]
     pub nickname: String,
+    /// Avatar URL (may be relative or a "no avatar" placeholder; see `avatar_url`).
+    #[serde(default, deserialize_with = "de_string")]
+    pub avatar: String,
+}
+
+impl Author {
+    pub fn avatar_url(&self) -> Option<String> {
+        let a = self.avatar.trim();
+        if a.is_empty() || a.contains("no_avatar") {
+            return None;
+        }
+        Some(if a.starts_with("//") { format!("https:{a}") } else if a.starts_with('/') { format!("{BASE}{a}") } else { a.to_string() })
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -212,6 +227,9 @@ pub struct Post {
     /// Identifies the post across languages; used in /post/<lang_group>/ URLs and /api/posts/get/.
     #[serde(default, deserialize_with = "de_u64")]
     pub lang_group: u64,
+    /// The id of this language version (comments use it as `postId`).
+    #[serde(default, deserialize_with = "de_u64")]
+    pub id: u64,
     #[serde(rename = "type", default, deserialize_with = "de_string")]
     pub kind: String,
     #[serde(default, deserialize_with = "de_i64")]
@@ -284,6 +302,79 @@ impl Post {
     pub fn url(&self) -> String {
         format!("{BASE}/post/{}/en/", self.lang_group)
     }
+
+    /// Whether the post looks like anime / itasha artwork. The site has no flag for it, so this
+    /// checks hashtags and a few franchise names in the text (words that are also normal War
+    /// Thunder vocabulary, like "panzer" or "girl", are deliberately left out).
+    pub fn looks_anime(&self) -> bool {
+        let norm = |s: &str| s.to_lowercase().replace(['_', '-', ' ', '\''], "");
+        let tags: Vec<String> = self.hashtags().iter().map(|t| norm(t.trim_start_matches('#'))).collect();
+        if tags.iter().any(|t| ANIME_TAGS.iter().any(|a| norm(a) == *t)) {
+            return true;
+        }
+        let text = format!(" {} ", self.text().to_lowercase());
+        ANIME_WORDS.iter().any(|w| {
+            text.match_indices(w).any(|(i, _)| {
+                let before = text[..i].chars().last().unwrap_or(' ');
+                let after = text[i + w.len()..].chars().next().unwrap_or(' ');
+                !before.is_alphanumeric() && !after.is_alphanumeric()
+            })
+        })
+    }
+}
+
+/// Hashtags (compared without case, spaces, `_` or `-`) that mark anime-styled posts. From a
+/// sample of 200 popular and new camouflages.
+const ANIME_TAGS: &[&str] = &[
+    "anime", "animeskin", "anime_art", "animegirl", "itasha", "waifu", "weeb", "manga", "kawaii", "moe", "neko", "loli",
+    "hentai", "ecchi", "nsfw", "lewd", "r18", "girls_und_panzer", "gup", "pravda_high_school", "girls_frontline",
+    "azur_lane", "kancolle", "kantai_collection", "arknights", "rezero", "blue_archive", "genshin", "genshin_impact",
+    "hololive", "vtuber", "touhou", "idolmaster", "theidolmaster", "evangelion", "hatsune_miku", "miku", "umamusume",
+    "honkai", "nikke", "vocaloid",
+];
+
+/// Whole words or phrases in the description that mark anime-styled posts.
+const ANIME_WORDS: &[&str] = &[
+    "anime", "itasha", "waifu", "hentai", "girls und panzer", "girls' frontline", "girls frontline", "azur lane", "kancolle",
+    "kantai collection", "blue archive", "genshin", "hololive", "touhou", "idolm@ster", "idolmaster", "evangelion",
+    "arknights", "re:zero", "hatsune miku", "vocaloid", "uma musume", "umamusume",
+];
+
+/// A creator's public profile, read from their page (the site has no JSON for it).
+#[derive(Clone, Debug, Default)]
+pub struct Profile {
+    pub nickname: String,
+    pub avatar: Option<String>,
+    pub reputation: u64,
+    pub posts: u64,
+    pub comments: u64,
+    pub subscribers: u64,
+}
+
+impl Profile {
+    pub fn url(id: u64) -> String {
+        format!("{BASE}/user/{id}/")
+    }
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct Comment {
+    #[serde(default, deserialize_with = "de_u64")]
+    pub id: u64,
+    /// 0 = top level, else the id of the comment it answers.
+    #[serde(default, deserialize_with = "de_u64")]
+    pub parent: u64,
+    #[serde(default, deserialize_with = "de_opt")]
+    pub author: Option<Author>,
+    #[serde(default, deserialize_with = "de_i64")]
+    pub created: i64,
+    #[serde(default, deserialize_with = "de_i64")]
+    pub rating: i64,
+    /// HTML.
+    #[serde(default, deserialize_with = "de_string")]
+    pub text: String,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -312,9 +403,28 @@ fn net_err(e: reqwest::Error) -> String {
     }
 }
 
+/// The live.warthunder.com session cookies ("name=value; ...") after logging in.
+static SESSION: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+pub fn set_session(cookies: Option<String>) {
+    if let Ok(mut s) = SESSION.write() {
+        *s = cookies;
+    }
+}
+
+fn session() -> Option<String> {
+    SESSION.read().ok().and_then(|s| s.clone())
+}
+
+fn with_session(req: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+    match session() {
+        Some(c) => req.header(reqwest::header::COOKIE, c),
+        None => req,
+    }
+}
+
 fn post_form(path: &str, form: &[(&str, &str)]) -> Result<Value, String> {
-    let text = client()
-        .post(format!("{BASE}{path}"))
+    let text = with_session(client().post(format!("{BASE}{path}")))
         .timeout(Duration::from_secs(25))
         .form(form)
         .send()
@@ -381,9 +491,161 @@ pub fn fetch_post(lang_group: u64) -> Result<Post, String> {
     serde_json::from_value(v).map_err(|_| "Could not read the post".into())
 }
 
+fn ok_list(v: &Value) -> Result<Vec<Value>, String> {
+    if v.get("status").and_then(Value::as_str) != Some("OK") {
+        let msg = v.get("msg").or_else(|| v.get("message")).and_then(Value::as_str).unwrap_or("unknown error");
+        return Err(format!("live.warthunder.com: {msg}"));
+    }
+    Ok(v.pointer("/data/list").and_then(Value::as_array).cloned().unwrap_or_default())
+}
+
+/// One page (25) of a creator's posts, newest first, only the types this app can install.
+pub fn fetch_user_posts(user_id: u64, page: u32) -> Result<(Vec<Post>, bool), String> {
+    let (user, page) = (user_id.to_string(), page.to_string());
+    let form = [
+        ("content", "all"),
+        ("sort", "created"),
+        ("user", user.as_str()),
+        ("period", "0"),
+        ("searchString", ""),
+        ("page", page.as_str()),
+        ("featured", "false"),
+        ("subtype", "all"),
+    ];
+    let list = ok_list(&post_form("/api/feed/get_user/", &form)?)?;
+    let more = !list.is_empty();
+    let posts = list
+        .into_iter()
+        .filter_map(|item| serde_json::from_value::<Post>(item).ok())
+        .filter(|p| p.lang_group != 0 && p.kind().is_some())
+        .collect();
+    Ok((posts, more))
+}
+
+/// The number in `<strong>N</strong>` right after `marker` ("Reputation: <strong>2036</strong>").
+fn strong_after(html: &str, marker: &str) -> u64 {
+    (|| {
+        let rest = &html[html.find(marker)? + marker.len()..];
+        let a = rest.find("<strong>")? + 8;
+        let b = rest[a..].find("</strong>")? + a;
+        rest[a..b].trim().replace([',', ' '], "").parse().ok()
+    })()
+    .unwrap_or(0)
+}
+
+/// The number in `<strong>N</strong>` right before `suffix` ("<strong>21</strong> posts").
+fn strong_before(html: &str, suffix: &str) -> u64 {
+    (|| {
+        let before = &html[..html.find(suffix)?];
+        let a = before.rfind("<strong>")? + 8;
+        before[a..].trim().replace([',', ' '], "").parse().ok()
+    })()
+    .unwrap_or(0)
+}
+
+fn img_after(html: &str, marker: &str) -> Option<String> {
+    let i = html.find(marker)?;
+    let rest = &html[i..];
+    let a = rest.find("<img")?;
+    let src = rest[a..].find("src=\"")? + a + 5;
+    let end = rest[src..].find('"')? + src;
+    let url = decode_entities(&rest[src..end]);
+    (!url.is_empty() && !url.contains("no_avatar")).then_some(url)
+}
+
+pub fn fetch_profile(user_id: u64) -> Result<Profile, String> {
+    let html = with_session(client().get(Profile::url(user_id)))
+        .timeout(Duration::from_secs(25))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.text())
+        .map_err(net_err)?;
+    let nickname = html
+        .find("data_line nickname")
+        .and_then(|i| {
+            let rest = &html[i..];
+            let a = rest.find("<span>")? + 6;
+            let b = rest[a..].find("</span>")? + a;
+            Some(decode_entities(rest[a..b].trim()))
+        })
+        .unwrap_or_default();
+    if nickname.is_empty() {
+        return Err("This creator's profile could not be read".into());
+    }
+    Ok(Profile {
+        nickname,
+        avatar: img_after(&html, "class=\"avatar \"").or_else(|| img_after(&html, "class=\"avatar\"")),
+        reputation: strong_after(&html, "Reputation:"),
+        posts: strong_before(&html, "</strong> posts"),
+        comments: strong_before(&html, "</strong> comments"),
+        subscribers: strong_before(&html, "</strong> subscribers"),
+    })
+}
+
+/// All comments of a post (the site sends them in one answer). Works without logging in.
+pub fn fetch_comments(post_id: u64, lang_group: u64) -> Result<Vec<Comment>, String> {
+    let (pid, lg) = (post_id.to_string(), lang_group.to_string());
+    let list = ok_list(&post_form("/api/comment/get_list/", &[("postId", pid.as_str()), ("langGroup", lg.as_str())])?)?;
+    Ok(list.into_iter().filter_map(|c| serde_json::from_value::<Comment>(c).ok()).filter(|c| !c.deleted).collect())
+}
+
+fn ok_data(v: Value) -> Result<Value, String> {
+    if v.get("status").and_then(Value::as_str) == Some("OK") {
+        return Ok(v.get("data").cloned().unwrap_or(Value::Null));
+    }
+    let msg = v.get("msg").or_else(|| v.get("message")).and_then(Value::as_str).unwrap_or("");
+    Err(if msg.is_empty() { "live.warthunder.com refused this. Are you still logged in?".into() } else { format!("live.warthunder.com: {msg}") })
+}
+
+/// Toggles the like on a post (needs a session). Returns (likes, liked now).
+pub fn toggle_like(lang_group: u64) -> Result<(u64, bool), String> {
+    if session().is_none() {
+        return Err("Log in to like posts".into());
+    }
+    let lg = lang_group.to_string();
+    let data = ok_data(post_form("/api/post/like/", &[("lang_group", lg.as_str())])?)?;
+    let likes = data.get("likes").and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok())).unwrap_or(0);
+    let liked = data.get("isLiked").and_then(|v| v.as_bool().or_else(|| Some(v.as_u64()? != 0))).unwrap_or(false);
+    Ok((likes, liked))
+}
+
+/// Posts a comment (needs a session). `reply_to` is the id of the comment being answered.
+pub fn post_comment(post_id: u64, lang_group: u64, text: &str, reply_to: Option<u64>) -> Result<(), String> {
+    if session().is_none() {
+        return Err("Log in to comment".into());
+    }
+    let (pid, lg) = (post_id.to_string(), lang_group.to_string());
+    let reply = reply_to.map(|r| r.to_string()).unwrap_or_default();
+    let mut form = vec![("text", text), ("postId", pid.as_str()), ("langGroup", lg.as_str())];
+    if reply_to.is_some() {
+        form.push(("replyId", reply.as_str()));
+    }
+    ok_data(post_form("/api/comment/create/", &form)?).map(|_| ())
+}
+
+/// The logged-in user's id according to the site (0 = the cookies are not, or no longer, valid).
+pub fn whoami() -> Result<u64, String> {
+    let html = with_session(client().get(format!("{BASE}/feed/")))
+        .timeout(Duration::from_secs(25))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.text())
+        .map_err(net_err)?;
+    Ok(parse_user_id(&html))
+}
+
+/// Reads `user_id: 123` from the page's `live_wt` settings script.
+pub fn parse_user_id(html: &str) -> u64 {
+    html.find("user_id:")
+        .map(|i| html[i + 8..].trim_start().chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Downloads `url` to `dest` (via a .part file), reporting (bytes done, total) as it goes.
 /// Returns the file's upload date (`Last-Modified`) if the server sent one.
-pub fn download(url: &str, dest: &Path, mut progress: impl FnMut(u64, Option<u64>)) -> Result<Option<i64>, String> {
+/// Streams `url` to `dest`. `progress` is called every 256 KB; returning `false` cancels.
+pub fn download(url: &str, dest: &Path, mut progress: impl FnMut(u64, Option<u64>) -> bool) -> Result<Option<i64>, String> {
     let mut resp = client()
         .get(url)
         .send()
@@ -410,7 +672,11 @@ pub fn download(url: &str, dest: &Path, mut progress: impl FnMut(u64, Option<u64
         out.write_all(&buf[..n]).map_err(|e| format!("Could not save download: {e}"))?;
         done += n as u64;
         if done - reported >= 256 * 1024 {
-            progress(done, total);
+            if !progress(done, total) {
+                drop(out);
+                let _ = fs::remove_file(&part);
+                return Err(CANCELLED.into());
+            }
             reported = done;
         }
     }
@@ -590,5 +856,37 @@ mod tests {
     #[test]
     fn search_becomes_hashtags() {
         assert_eq!(hashtagify(" leopard  #t_34 "), "#leopard #t_34");
+    }
+}
+
+#[cfg(test)]
+mod site_tests {
+    use super::*;
+
+    fn post(desc: &str) -> Post {
+        Post { description: desc.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn anime_detection() {
+        assert!(post("Nishizumi's Tiger #girls_und_panzer").looks_anime());
+        assert!(post("Cute skin #Anime #T_34").looks_anime());
+        assert!(post("Azur Lane themed destroyer").looks_anime());
+        assert!(!post("Panzer IV desert camo #pz4 #germany").looks_anime());
+        assert!(!post("Fate of the Leopard 2 #leopard").looks_anime());
+        assert!(!post("Animated decal pack").looks_anime()); // not the whole word "anime"
+    }
+
+    #[test]
+    fn profile_numbers_parse() {
+        let html = r#"<div class="data_line reputation"><span>Reputation: <strong>2036</strong></span></div>
+            <div class="data_line"><span><strong>21</strong> posts</span></div>
+            <div class="data_line subscribers"><span><strong>1,165</strong> subscribers</span></div>"#;
+        assert_eq!(strong_after(html, "Reputation:"), 2036);
+        assert_eq!(strong_before(html, "</strong> posts"), 21);
+        assert_eq!(strong_before(html, "</strong> subscribers"), 1165);
+        assert_eq!(strong_before(html, "</strong> comments"), 0);
+        assert_eq!(parse_user_id("var live_wt = { user_id: 4242, x: 1 }"), 4242);
+        assert_eq!(parse_user_id("user_id: 0,"), 0);
     }
 }

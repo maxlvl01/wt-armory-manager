@@ -32,11 +32,33 @@ pub fn controls_dir() -> PathBuf {
         .join("WT Armory Manager presets")
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct Settings {
     pub game_root: Option<PathBuf>,
     /// Gaijin user ID folder under Documents\My Games\WarThunder\Saves (used for sights).
     pub user_id: Option<String>,
+    /// Download and install new app versions on their own (otherwise only tell about them).
+    pub auto_update: bool,
+    /// Hide posts that look like anime / itasha artwork.
+    pub hide_anime: bool,
+    /// Followed creators, by author id.
+    pub favourite_authors: std::collections::BTreeMap<u64, FavAuthor>,
+    /// Creators whose posts are never shown (id -> nickname).
+    pub hidden_authors: std::collections::BTreeMap<u64, String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            game_root: None,
+            user_id: None,
+            auto_update: true,
+            hide_anime: false,
+            favourite_authors: Default::default(),
+            hidden_authors: Default::default(),
+        }
+    }
 }
 
 pub fn load<T: DeserializeOwned + Default>(name: &str) -> T {
@@ -78,4 +100,12 @@ pub fn open_in_explorer(path: &Path) {
         cmd.arg(path);
     }
     let _ = cmd.spawn();
+}
+
+/// A creator the user follows in the app (kept locally; the site has no favourites list).
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct FavAuthor {
+    pub nickname: String,
+    #[serde(default)]
+    pub avatar: Option<String>,
 }
