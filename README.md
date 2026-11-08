@@ -16,9 +16,10 @@ Browse [live.warthunder.com](https://live.warthunder.com) and install War Thunde
   | Sights | `Documents\My Games\WarThunder\Saves\<user ID>\production\UserSights` |
   | Missions | `<game>\UserMissions` |
   | Custom models | merged into the game folder (`content`, `UserMissions`) |
-  | Hangars | merged into the game folder, and sets `hangarBlk` in `config.blk` |
+  | Hangars | merged into the game folder; switch them on and off in the app (sets `hangarBlk` in `config.blk`) |
   | Control presets | `Documents\My Games\WarThunder\WT Armory Manager presets` (import in game: Controls > Import from file) |
 
+- **Hangar switch.** After you install a hangar, the app asks before replacing your current one. Each installed hangar gets an on/off switch, and one click on **Use default hangar** brings back the normal hangar.
 - **Clean uninstall.** The app removes exactly the files it added, restores any file it replaced, and undoes its `config.blk` changes.
 - **Compatibility check.** Each mod is compared with the latest major War Thunder update, read live from the official changelog. A badge shows whether it was made for the current version or how many major updates old it is. There is also a filter to show only up-to-date mods.
 - **Finds your game automatically** in the Gaijin launcher folder or any Steam library, or lets you choose the folder yourself.

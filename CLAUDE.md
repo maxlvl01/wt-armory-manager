@@ -41,6 +41,7 @@ Windows can't overwrite a running exe, so close the app (or check `Get-Process W
   - Missions go in `UserMissions`, with no subfolders.
   - Models and hangars merge into the game root.
   - Control presets can only be imported in game, so they are saved to `Documents\My Games\WarThunder\WT Armory Manager presets`. They used to go to `Documents\WT Armory Manager\...`, which is this repo's folder on Max's PC, so keep downloads out of the project folder.
+- **Hangars are never switched on by installing.** The installer only records `ConfigChange::Hangar { value }`. After installing, a popup asks "Use new hangar / Keep current hangar / Remove it". The Hangar panel (Installed page and the Hangars page) has one on/off switch per installed hangar (only one can be active) and a "Use default hangar" button. That button removes the top-level `hangarBlk` line, which brings back War Thunder's default hangar. Uninstalling the active hangar also falls back to the default.
 - **Uninstall must be exact.** The installer records every file written and every folder created, and backs up every file it overwrites. Never delete anything that isn't recorded in the manifest.
 - **config.blk:** edit line by line while tracking brace depth, never parse and rewrite the whole file. Take a timestamped backup before each write. Refuse edits while `aces.exe` runs, because the game rewrites the file when it exits.
 
@@ -53,7 +54,9 @@ Windows can't overwrite a running exe, so close the app (or check `Get-Process W
 
 ## Verifying the UI
 
-The computer-use tool can't target this app because it isn't "installed". To take a screenshot, run a PowerShell `CopyFromScreen` script on the window rect. That pulls the window to the front, so don't do it while Max is using the app.
+The computer-use tool can't target this app because it isn't "installed". To take a screenshot, run a PowerShell `CopyFromScreen` script on the window rect. That pulls the window to the front, so don't do it while Max is using the app. Clicks injected with `SetCursorPos` and `mouse_event` only work reliably while the window already has focus.
+
+To test without touching Max's real game, set `WTAM_DATA_DIR` to a scratch folder. Its `settings.json` can point `game_root` at a fake game folder (it needs `win64\aces.exe`, `content\pkg_main.ver` and `config.blk`), and `installed.json` can be hand-written.
 
 ## Releases
 

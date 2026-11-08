@@ -99,6 +99,16 @@ enum Action {
     OpenUrl(String),
     Search(String),
     NeedDate(String),
+    /// `None` = War Thunder's default hangar.
+    SetHangar(Option<String>),
+    HangarChoice(u64, HangarChoice),
+}
+
+#[derive(Clone, Copy)]
+enum HangarChoice {
+    Use,
+    Keep,
+    Remove,
 }
 
 struct Toast {
@@ -145,6 +155,11 @@ struct App {
     dates_saved_at: f64,
     date_tx: Sender<String>,
     only_current: bool,
+
+    /// `hangarBlk` value from config.blk; `None` = default hangar.
+    current_hangar: Option<String>,
+    /// A just-installed hangar waiting for "use it / keep current / remove".
+    hangar_prompt: Option<u64>,
 }
 
 impl App {
@@ -219,7 +234,10 @@ impl App {
             dates_saved_at: 0.0,
             date_tx,
             only_current: false,
+            current_hangar: None,
+            hangar_prompt: None,
         };
+        app.refresh_hangar();
         if let (Some(old), Some(new)) = (&previous_root, &app.settings.game_root) {
             if old != new {
                 app.toast(
@@ -236,6 +254,157 @@ impl App {
             app.reload();
         }
         app
+    }
+
+    // ---- hangars -------------------------------------------------------------------------------
+
+    fn refresh_hangar(&mut self) {
+        self.current_hangar = self.settings.game_root.as_deref().and_then(|r| game::get_hangar(r).ok().flatten());
+    }
+
+    /// Installed hangars: (item, hangarBlk value).
+    fn installed_hangars(&self) -> Vec<(&Installed, &str)> {
+        self.manifest
+            .items
+            .iter()
+            .filter_map(|i| match &i.config {
+                Some(installer::ConfigChange::Hangar { value }) => Some((i, value.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn hangar_active(&self, value: &str) -> bool {
+        game::hangar_matches(self.current_hangar.as_deref(), value)
+    }
+
+    fn hangar_display(&self) -> String {
+        match &self.current_hangar {
+            None => "War Thunder's default hangar".into(),
+            Some(v) => self
+                .installed_hangars()
+                .into_iter()
+                .find(|(_, value)| game::hangar_matches(Some(v), value))
+                .map(|(i, _)| format!("\"{}\"", i.title))
+                .unwrap_or_else(|| format!("a custom hangar ({v})")),
+        }
+    }
+
+    fn set_hangar(&mut self, value: Option<String>) {
+        let Some(root) = self.settings.game_root.clone() else { return };
+        if game::is_game_running() {
+            self.toast("Close War Thunder first: the game rewrites config.blk when it exits.", true);
+            return;
+        }
+        match game::set_hangar(&root, value.as_deref()) {
+            Ok(()) => {
+                self.refresh_hangar();
+                let msg = match value {
+                    Some(_) => format!("Hangar switched to {}. Restart War Thunder to see it.", self.hangar_display()),
+                    None => "Default hangar restored. Restart War Thunder to see it.".to_string(),
+                };
+                self.toast(msg, false);
+            }
+            Err(e) => self.toast(e, true),
+        }
+    }
+
+    /// Hangar status, a switch per installed hangar and a "default hangar" button.
+    fn hangar_panel(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let hangars = self.installed_hangars();
+        if hangars.is_empty() && self.current_hangar.is_none() {
+            return;
+        }
+        Frame::none()
+            .fill(CARD)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .rounding(8.0)
+            .inner_margin(Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    icons::show(ui, Icon::Kind(Kind::Location), 18.0, ACCENT);
+                    ui.label(RichText::new("Hangar").family(bold()).size(16.0).color(TEXT));
+                    ui.add_space(8.0);
+                    ui.label(muted("In use:"));
+                    ui.label(RichText::new(self.hangar_display()).size(13.0).color(TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let custom = self.current_hangar.is_some();
+                        let r = button(ui, None, "Use default hangar", if custom { ACCENT } else { BTN }, if custom { ON_ACCENT } else { MUTED }, None, custom);
+                        if r.on_hover_text("Remove the custom hangar line from config.blk").clicked() {
+                            actions.push(Action::SetHangar(None));
+                        }
+                    });
+                });
+                if hangars.is_empty() {
+                    ui.label(muted("This hangar was set outside WT Armory Manager."));
+                }
+                for (item, value) in hangars {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let on = self.hangar_active(value);
+                        if toggle(ui, on).on_hover_text(if on { "Switch back to the default hangar" } else { "Use this hangar" }).clicked() {
+                            actions.push(Action::SetHangar(if on { None } else { Some(value.to_string()) }));
+                        }
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(&item.title).size(14.0).color(if on { TEXT } else { TEXT.gamma_multiply(0.8) }));
+                        ui.label(muted(value));
+                    });
+                }
+                ui.add_space(2.0);
+                ui.label(muted("Only one custom hangar can be active. Restart War Thunder after switching."));
+            });
+        ui.add_space(10.0);
+    }
+
+    fn hangar_prompt_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let Some(id) = self.hangar_prompt else { return };
+        let Some(item) = self.manifest.get(id) else {
+            self.hangar_prompt = None;
+            return;
+        };
+        let title = item.title.clone();
+        // Dim the app behind the dialog.
+        egui::Area::new(egui::Id::new("hangar_dim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(pos2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                ui.allocate_rect(screen, Sense::click());
+                ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(150));
+            });
+        egui::Window::new(RichText::new("Use your new hangar?").family(bold()).size(17.0).color(TEXT))
+            .id(egui::Id::new("hangar_prompt"))
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                ui.set_max_width(480.0);
+                ui.label(RichText::new(format!("\"{title}\" is installed.")).size(14.0).color(TEXT));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Using it will replace your current hangar ({}). You can switch back to the default hangar at any time on the Installed page.",
+                        self.hangar_display()
+                    ))
+                    .size(13.5)
+                    .color(MUTED),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if button(ui, Some(Icon::Check), "Use new hangar", ACCENT, ON_ACCENT, None, true).clicked() {
+                        actions.push(Action::HangarChoice(id, HangarChoice::Use));
+                    }
+                    if button(ui, None, "Keep current hangar", BTN, TEXT, None, true).clicked() {
+                        actions.push(Action::HangarChoice(id, HangarChoice::Keep));
+                    }
+                    if button(ui, None, "Remove it", DANGER_BG, DANGER, None, true).on_hover_text("Uninstall the hangar again").clicked() {
+                        actions.push(Action::HangarChoice(id, HangarChoice::Remove));
+                    }
+                });
+            });
     }
 
     // ---- compatibility ------------------------------------------------------------------------
@@ -361,11 +530,14 @@ impl App {
                     match result {
                         Ok(item) => {
                             let (title, note) = (item.title.clone(), item.note.clone());
+                            let is_hangar = matches!(item.config, Some(installer::ConfigChange::Hangar { .. }));
                             self.manifest.items.retain(|i| i.lang_group != id);
                             self.manifest.items.push(item);
                             self.save_manifest();
                             self.toast(format!("Installed \"{title}\""), false);
-                            if !note.is_empty() {
+                            if is_hangar {
+                                self.hangar_prompt = Some(id); // ask before replacing the current hangar
+                            } else if !note.is_empty() {
                                 self.toast(note, false);
                             }
                         }
@@ -433,7 +605,10 @@ impl App {
             Ok(()) => {
                 self.manifest.items.remove(pos);
                 self.save_manifest();
-                self.toast(format!("Removed \"{}\"", item.title), false);
+                let was_active = self.current_hangar.is_some();
+                self.refresh_hangar();
+                let restored = if was_active && self.current_hangar.is_none() { " The default hangar is back." } else { "" };
+                self.toast(format!("Removed \"{}\".{restored}", item.title), false);
             }
             Err(e) => self.toast(e, true),
         }
@@ -462,6 +637,7 @@ impl App {
                 self.game_version = game::installed_version(&root);
                 self.settings.game_root = Some(root);
                 self.save_settings();
+                self.refresh_hangar();
                 self.setup_error = None;
                 true
             }
@@ -572,6 +748,9 @@ impl App {
         });
         ui.label(muted(installer::describe_target(kind)));
         ui.add_space(10.0);
+        if kind == Kind::Location {
+            self.hangar_panel(ui, actions);
+        }
 
         ui.horizontal_wrapped(|ui| {
             for sort in Sort::ALL {
@@ -782,10 +961,11 @@ impl App {
                     .animate(job.installing || frac.is_none())
                     .text(RichText::new(text).color(TEXT).size(13.0)),
             );
-        } else if self.manifest.get(id).is_some() {
+        } else if let Some(item) = self.manifest.get(id) {
+            let in_use = matches!(&item.config, Some(installer::ConfigChange::Hangar { value }) if self.hangar_active(value));
             ui.allocate_ui_with_layout(vec2(width, 30.0), Layout::left_to_right(Align::Center), |ui| {
                 icons::show(ui, Icon::Check, 16.0, SUCCESS);
-                ui.label(RichText::new("Installed").family(bold()).color(SUCCESS));
+                ui.label(RichText::new(if in_use { "In use" } else { "Installed" }).family(bold()).color(SUCCESS));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if button(ui, None, "Uninstall", DANGER_BG, DANGER, None, true).clicked() {
                         actions.push(Action::Uninstall(id));
@@ -806,6 +986,7 @@ impl App {
         });
         ui.label(muted("Everything installed with WT Armory Manager. Uninstalling removes exactly the files that were added and restores anything that was replaced."));
         ui.add_space(12.0);
+        self.hangar_panel(ui, actions);
 
         if !self.jobs.is_empty() {
             ui.label(muted(format!("{} download(s) in progress...", self.jobs.len())));
@@ -1159,6 +1340,7 @@ impl eframe::App for App {
             });
         self.detail_window(ctx, &mut actions);
         self.settings_window(ctx);
+        self.hangar_prompt_window(ctx, &mut actions);
 
         for action in actions {
             match action {
@@ -1173,6 +1355,23 @@ impl eframe::App for App {
                     self.reload();
                 }
                 Action::NeedDate(link) => self.request_date(link),
+                Action::SetHangar(value) => self.set_hangar(value),
+                Action::HangarChoice(id, choice) => {
+                    self.hangar_prompt = None;
+                    match choice {
+                        HangarChoice::Use => {
+                            let value = self.manifest.get(id).and_then(|i| match &i.config {
+                                Some(installer::ConfigChange::Hangar { value }) => Some(value.clone()),
+                                _ => None,
+                            });
+                            if value.is_some() {
+                                self.set_hangar(value);
+                            }
+                        }
+                        HangarChoice::Keep => self.toast("Kept your current hangar. You can switch to the new one on the Installed page.", false),
+                        HangarChoice::Remove => self.uninstall(id),
+                    }
+                }
             }
         }
         self.save_file_dates_if_needed();
@@ -1219,6 +1418,25 @@ fn button(
         }
     }
     if enabled && resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// An on/off switch with an animated knob.
+fn toggle(ui: &mut egui::Ui, on: bool) -> egui::Response {
+    let size = vec2(38.0, 20.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool_responsive(resp.id, on);
+        let track = if on { ACCENT } else { shade(BTN, 10) };
+        let track = if resp.hovered() { shade(track, 14) } else { track };
+        ui.painter().rect_filled(rect, rect.height() / 2.0, track);
+        let r = rect.height() / 2.0 - 3.0;
+        let x = egui::lerp((rect.left() + r + 3.0)..=(rect.right() - r - 3.0), t);
+        ui.painter().circle_filled(pos2(x, rect.center().y), r, if on { ON_ACCENT } else { TEXT });
+    }
+    if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp

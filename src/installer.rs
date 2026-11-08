@@ -7,7 +7,7 @@
 //! | Sight       | `Documents\My Games\WarThunder\Saves\<uid>\production\UserSights\` | –                              |
 //! | Mission     | `<game>\UserMissions\` (or merged into the game root)              | –                              |
 //! | Model       | merged into the game root (`content\`, `UserMissions\`, ...)       | –                              |
-//! | Hangar      | merged into the game root                                          | top-level `hangarBlk:t="..."`  |
+//! | Hangar      | merged into the game root                                          | `hangarBlk:t="..."` on request |
 //! | Controls    | `Documents\My Games\WarThunder\WT Armory Manager presets\`         | import in game                 |
 //!
 //! Every written file, every overwritten file (backed up first) and every created folder is
@@ -25,7 +25,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ConfigChange {
     SoundMod,
-    Hangar { value: String, previous: Option<String> },
+    /// A custom hangar: `value` is what goes into `hangarBlk:t="..."` when the player switches it on.
+    /// Installing never switches it on by itself; the app asks first.
+    Hangar { value: String },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -201,7 +203,7 @@ pub fn install(post: &Post, target: &Target, download: &Path, file_date: Option<
     let file_name = post.file.as_ref().map(|f| f.name.clone()).unwrap_or_default();
     let root = &target.root;
 
-    if matches!(kind, Kind::Sound | Kind::Location) && game::is_game_running() {
+    if kind == Kind::Sound && game::is_game_running() {
         return Err("Close War Thunder first: the game rewrites config.blk when it exits.".into());
     }
 
@@ -333,15 +335,14 @@ pub fn install(post: &Post, target: &Target, download: &Path, file_date: Option<
                 _ => None,
             });
             match hangar {
-                Some(value) => game::get_hangar(root).and_then(|previous| {
-                    game::set_hangar(root, Some(&value))?;
+                Some(value) => {
                     inst.note = format!(
-                        "Hangar set in config.blk (hangarBlk:t=\"{value}\"). Restart War Thunder to see it. Custom \
-                         hangars do not load in the launcher's compatibility mode."
+                        "Custom hangar (hangarBlk:t=\"{value}\"). Switch it on or off on the Installed page; restart \
+                         War Thunder after switching. Custom hangars do not load in the launcher's compatibility mode."
                     );
-                    inst.config = Some(ConfigChange::Hangar { value, previous });
+                    inst.config = Some(ConfigChange::Hangar { value });
                     Ok(())
-                }),
+                }
                 None => {
                     inst.note = "Files were added to the game folder. Follow the author's notes if anything else is needed.".into();
                     Ok(())
@@ -472,10 +473,10 @@ pub fn uninstall(inst: &Installed, root: &Path, others: &[Installed]) -> Result<
                 game::set_sound_mod(root, false)?;
             }
         }
-        Some(ConfigChange::Hangar { value, previous }) => {
-            // Only revert when the player has not picked another hangar since.
-            if game::get_hangar(root)?.as_deref() == Some(value.as_str()) {
-                game::set_hangar(root, previous.as_deref())?;
+        Some(ConfigChange::Hangar { value }) => {
+            // Removing the hangar that is in use falls back to the default hangar.
+            if game::hangar_matches(game::get_hangar(root)?.as_deref(), value) {
+                game::set_hangar(root, None)?;
             }
         }
         None => {}
@@ -490,7 +491,7 @@ pub fn describe_target(kind: Kind) -> &'static str {
         Kind::Sight => "Installs into UserSights in your Documents\\My Games\\WarThunder\\Saves folder.",
         Kind::Mission => "Installs into UserMissions in your game folder.",
         Kind::Model => "Merges into your game folder (content, UserMissions).",
-        Kind::Location => "Merges into your game folder and sets the hangar in config.blk.",
+        Kind::Location => "Merges into your game folder. Hangars can be switched on and off in the app.",
         Kind::Controls => "Saved to Documents\\My Games\\WarThunder\\WT Armory Manager presets; import it in game under Controls.",
     }
 }

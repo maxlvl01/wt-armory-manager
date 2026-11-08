@@ -6,6 +6,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn app_dir() -> PathBuf {
+    // Development: run against a throwaway data folder (e.g. with a fake game root in settings.json).
+    if let Some(dir) = std::env::var_os("WTAM_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::data_local_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("WT Armory Manager")

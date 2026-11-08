@@ -281,7 +281,14 @@ pub fn get_hangar(root: &Path) -> Result<Option<String>, String> {
     }))
 }
 
+/// Whether the configured hangar is `value` (paths compare case-insensitively, either slash).
+pub fn hangar_matches(current: Option<&str>, value: &str) -> bool {
+    let norm = |s: &str| s.trim().replace('/', "\\").to_lowercase();
+    current.is_some_and(|c| norm(c) == norm(value))
+}
+
 /// Sets (or with `None` removes) the top-level `hangarBlk:t="..."` line.
+/// Removing it brings back War Thunder's default hangar.
 pub fn set_hangar(root: &Path, value: Option<&str>) -> Result<(), String> {
     let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cfg = Config::open(root)?;
@@ -330,6 +337,13 @@ mod tests {
         set_sound_mod(&root, true).unwrap();
         let t = fs::read_to_string(root.join("config.blk")).unwrap();
         assert!(t.ends_with("sound{\n  enable_mod:b=yes\n}\n"));
+    }
+
+    #[test]
+    fn hangar_paths_match_loosely() {
+        assert!(hangar_matches(Some("Hangars/My_Hangar.blk"), "hangars\\my_hangar.blk"));
+        assert!(!hangar_matches(Some("other.blk"), "my_hangar.blk"));
+        assert!(!hangar_matches(None, "my_hangar.blk"));
     }
 
     #[test]
